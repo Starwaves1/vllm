@@ -596,6 +596,15 @@ class OffloadingSpec(ABC):
             self.extra_config.get("offload_prompt_only", True)
         )
 
+        # When True, offloaded-prefix hits are loaded synchronously: the
+        # request is admitted through the same admission path as a plain
+        # (cache-miss) request and the worker blocks in start_load_kv until
+        # the transfer lands, instead of parking the request in
+        # WAITING_FOR_REMOTE_KVS behind an up-front full-hit reservation.
+        # Suited to fast local media (CPU/shm over PCIe), where the blocking
+        # copy is orders of magnitude cheaper than recomputing the prefix.
+        self.sync_load: bool = bool(self.extra_config.get("sync_load", False))
+
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
