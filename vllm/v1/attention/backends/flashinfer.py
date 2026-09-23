@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -89,6 +90,70 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# stage2-mtp-ima item 1: FlashInfer plan-buffer race.
+# plan() fills a PINNED host staging buffer (wrapper._pin_memory_int_workspace_
+# buffer) and then issues an unfenced cudaMemcpyAsync H2D from it (flashinfer
+# include/flashinfer/attention/scheduler.cuh, PrefillPlanImpl/DecodePlanImpl).
+# vLLM's builder does the same with its pinned paged_kv_indptr/last_page_len
+# CpuGpuBuffers. The MTP drafter re-plans the same wrappers once per draft
+# position inside one step. On a zero-draft step nothing in the drafter forces
+# a host sync (num_rejected_tokens_gpu is None, so seq_lens_cpu stays cached),
+# so all k plans are issued while the GPU is still in the target forward: the
+# later plan overwrites the pinned bytes before the earlier copy runs, and the
+# earlier draft pass runs with the later pass's tile/indptr tables.
+# From pageable memory cudaMemcpyAsync consumes the source before returning, so
+# a pageable staging buffer removes the hazard. The V2 model runner already
+# leaves these buffers unpinned for the same reason (see self.pin_memory).
+# VLLM_FLASHINFER_UNPINNED_PLAN_BUFFERS=0 restores the stock pinned behavior.
+_FI_PINNED_PLAN_ATTR = "_pin_memory_int_workspace_buffer"
+# Wrappers that hold other wrappers: BatchDCPPrefillWrapper (_context,
+# _new_tokens) and MultiLevelCascadeAttentionWrapper (_batch_prefill_wrappers).
+_FI_NESTED_WRAPPER_ATTRS = ("_context", "_new_tokens", "_batch_prefill_wrappers")
+
+
+def unpinned_plan_buffers_enabled() -> bool:
+    value = os.environ.get("VLLM_FLASHINFER_UNPINNED_PLAN_BUFFERS", "1")
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def unpin_flashinfer_plan_buffers(wrapper) -> int:
+    """Swap the pinned plan staging buffer of `wrapper` (and of any wrappers
+    nested in it) for a pageable CPU tensor of the same shape and dtype.
+
+    Returns the number of buffers replaced. No-op when the env gate is off.
+    """
+    if wrapper is None or not unpinned_plan_buffers_enabled():
+        return 0
+    replaced = 0
+    seen: set[int] = set()
+    stack = [wrapper]
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        buf = getattr(obj, _FI_PINNED_PLAN_ATTR, None)
+        if isinstance(buf, torch.Tensor) and buf.device.type == "cpu":
+            setattr(
+                obj,
+                _FI_PINNED_PLAN_ATTR,
+                torch.empty(buf.shape, dtype=buf.dtype, device="cpu"),
+            )
+            replaced += 1
+        for name in _FI_NESTED_WRAPPER_ATTRS:
+            child = getattr(obj, name, None)
+            if isinstance(child, (list, tuple)):
+                stack.extend(child)
+            elif child is not None:
+                stack.append(child)
+    if replaced:
+        logger.info_once(
+            "FlashInfer plan staging buffers are pageable "
+            "(VLLM_FLASHINFER_UNPINNED_PLAN_BUFFERS=1): draft re-plans cannot "
+            "overwrite a pending H2D copy."
+        )
+    return replaced
 
 trtllm_workspace_buffer = None
 
@@ -834,7 +899,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Since we do not have explicit synchronization in ModelRunnerV2, we do not pin
         # reused CPU buffers to avoid a race condition between step N async copies to
         # GPU and step N+1 buffer updates.
-        self.pin_memory = not vllm_config.use_v2_model_runner and PIN_MEMORY
+        # stage2-mtp-ima item 1: the V1 runner has the same hazard inside one
+        # step, because the drafter rebuilds this metadata once per draft
+        # position without a host sync in between (see
+        # unpin_flashinfer_plan_buffers).
+        self.pin_memory = (
+            not vllm_config.use_v2_model_runner
+            and PIN_MEMORY
+            and not unpinned_plan_buffers_enabled()
+        )
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
             self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
@@ -990,6 +1063,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     get_kv_cache_layout(),
                     backend="auto",
                 )
+                unpin_flashinfer_plan_buffers(self._noncausal_prefill_wrapper)
             return self._noncausal_prefill_wrapper
 
         if self._prefill_wrapper is None:
@@ -1007,6 +1081,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     get_kv_cache_layout(),
                     backend=backend,
                 )
+            unpin_flashinfer_plan_buffers(self._prefill_wrapper)
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
@@ -1041,6 +1116,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 use_tensor_cores=True,
                 backend=backend,
             )
+            unpin_flashinfer_plan_buffers(decode_wrapper)
 
             # save the decode wrapper
             if use_cudagraph:
@@ -1055,6 +1131,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._cascade_wrapper = MultiLevelCascadeAttentionWrapper(
                 2, self._get_workspace_buffer(), get_kv_cache_layout()
             )
+            unpin_flashinfer_plan_buffers(self._cascade_wrapper)
         return self._cascade_wrapper
 
     def _compute_flashinfer_kv_metadata(
