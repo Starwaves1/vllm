@@ -29,6 +29,11 @@ CacheDType = Literal[
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
+    # port(0.27.1): KVarN presets (dense only; kvarn_mla_* not ported)
+    "kvarn_k4v2_g128",
+    "kvarn_k4v4_g128",
+    "kvarn_k4v2_g64",
+    "kvarn_k4v4_g64",
     "int4_per_token_head",
     "int8_per_token_head",
     "fp8_per_token_head",

@@ -152,6 +152,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KVARN,  # port(0.27.1): KVarN backend
             ]
         else:
             return [
@@ -160,6 +161,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KVARN,  # port(0.27.1): KVarN backend
             ]
 
 
@@ -346,6 +348,130 @@ class CudaPlatformBase(Platform):
                 "setting in %%USERPROFILE%%\\.wslconfig and run "
                 "`wsl --shutdown`."
             )
+
+        # port(0.27.1): KVarN block carried over from KVarN's cuda.py (v0.23.0
+        # base); the only behavioural change is the SWA gate on the
+        # kv_cache_dtype_skip_layers append (see below).
+        # KVarN keeps a fixed-size fp16 tail pool (sink + in-progress tile per
+        # active request, per layer). Its size bounds peak concurrency, so cap
+        # max_num_seqs at what a bounded pool budget supports. This makes the
+        # pool both OOM-safe (≤ budget) and exhaustion-safe (scheduler cannot
+        # exceed it), with no per-model tuning. Tune via KVARN_POOL_MEM_FRAC.
+        cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if (
+            model_config is not None
+            and isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not cache_dtype.startswith("kvarn_mla")  # MLA path: separate machinery
+            # MLA models route ANY kvarn_ dtype (incl. kvarn_k4v2_g128) to the
+            # MLA latent-quant path, which has its own pool — the dense fp16
+            # tail-pool sizing/skip-layers below must NOT run for them.
+            and not getattr(model_config, "use_mla", False)
+        ):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            # KVarN supports head_dim 128 / 256 / 512 (the variance-normalization
+            # tile is head_dim x group). Fail fast with a clear message rather
+            # than crashing deep in a kernel with a shape error otherwise.
+            head_size = model_config.get_head_size()
+            if head_size not in (128, 256, 512):
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim in (128, 256, 512), but this "
+                    f"model has head_dim={head_size}; use a different "
+                    f"--kv-cache-dtype for this model."
+                )
+
+            # KVarN is a full-attention KV quantizer; its decode path does not
+            # implement a sliding-window mask. Keep sliding-window layers in the
+            # default (full-precision) dtype so hybrid / SWA models (Gemma,
+            # Mistral, gpt-oss, ...) stay correct — KVarN compresses only the
+            # full-attention layers. This is a no-op for full-attention models.
+            #
+            # port(0.27.1): only append the skip entry when the model really has
+            # sliding-window layers. In 0.27.1 a non-empty
+            # kv_cache_dtype_skip_layers triggers
+            # Platform._align_heterogeneous_kv_block_size, which sizes the
+            # primary page with the FullAttentionSpec uint8 formula (not the
+            # packed KVarN slot) and re-pads every mamba page to it — on a
+            # hybrid model without SWA layers (Qwen3.5/3.8) that would double
+            # the GDN pages for nothing. Mirrors arg_utils: with `layer_types`
+            # present, only "sliding_attention" entries make SWA layers;
+            # otherwise a non-None `sliding_window` applies model-wide.
+            hf_text_config = getattr(model_config, "hf_text_config", None)
+            _layer_types = getattr(hf_text_config, "layer_types", None)
+            if _layer_types:
+                _model_has_swa = "sliding_attention" in _layer_types
+            else:
+                _model_has_swa = (
+                    getattr(hf_text_config, "sliding_window", None) is not None
+                )
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            _quant_sliding = os.environ.get("KVARN_QUANT_SLIDING") == "1"
+            if _quant_sliding:
+                # Experimental: quantize sliding-window layers too (window>group).
+                while "sliding_window" in skip_layers:
+                    skip_layers.remove("sliding_window")
+                logger.info("KVarN (%s): KVARN_QUANT_SLIDING=1 — quantizing "
+                            "sliding-window layers too.", cache_dtype)
+            elif "sliding_window" not in skip_layers and _model_has_swa:
+                skip_layers.append("sliding_window")
+                logger.info(
+                    "KVarN (%s): sliding-window attention layers (if any) are "
+                    "kept in full precision; KVarN compresses full-attention "
+                    "layers only.",
+                    cache_dtype,
+                )
+
+            kvarn_cfg = KVarNConfig.from_cache_dtype(
+                cache_dtype, model_config.get_head_size()
+            )
+            # Query total GPU memory via NVML (cls.get_device_total_memory) so we
+            # do NOT initialize a CUDA context in the parent here — doing so would
+            # force `spawn` multiprocessing for tensor parallelism.
+            total_gpu_bytes = cls.get_device_total_memory()
+            # Weight-aware pool budget (issue #15): size the pool from the
+            # post-weight usable envelope (util·total − weights) rather than a
+            # fixed slice of total memory, so a small model on a big card gets a
+            # large pool / high concurrency instead of being strangled while the
+            # KV cache sits near-empty. weight_bytes is read off the checkpoint
+            # files on disk (no CUDA context); if unreadable, max_supported_seqs
+            # falls back to the legacy fraction-of-total budget.
+            weight_bytes = kvarn_cfg.estimate_weight_bytes(
+                model_config.model,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+            )
+            # The fp16 tail pool exists ONLY for the full-attention layers KVarN
+            # quantizes — NOT the Mamba/linear-attention layers of a hybrid model
+            # (Qwen3.5/3.6, Jamba, ...). Sizing the pool by all layers would
+            # over-reserve it ~Nx on a hybrid (starving the Mamba/KV caches -> OOM
+            # or cap collapse). Use the attention-layer count; for a dense model
+            # this equals total layers, so the dense path is unchanged.
+            kvarn_layers = KVarNConfig.num_kvarn_layers(model_config, parallel_config)
+            supported = kvarn_cfg.max_supported_seqs(
+                total_gpu_bytes=total_gpu_bytes,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                num_layers=kvarn_layers,
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                gpu_memory_utilization=cache_config.gpu_memory_utilization,
+                weight_bytes=weight_bytes,
+            )
+            if scheduler_config.max_num_seqs > supported:
+                _budget_kind = ("post-weight usable memory"
+                                if weight_bytes is not None else "total GPU memory")
+                logger.warning(
+                    "KVarN (%s): capping max_num_seqs %d -> %d so the fp16 tail "
+                    "pool fits its budget (a share of %s). To raise it: increase "
+                    "--gpu-memory-utilization or set KVARN_POOL_MEM_FRAC higher "
+                    "(the pool, not KV capacity, is the limit here).",
+                    cache_dtype,
+                    scheduler_config.max_num_seqs,
+                    supported,
+                    _budget_kind,
+                )
+                scheduler_config.max_num_seqs = supported
 
     @classmethod
     def get_current_memory_usage(
