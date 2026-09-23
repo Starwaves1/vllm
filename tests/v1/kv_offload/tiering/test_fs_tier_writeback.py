@@ -72,7 +72,7 @@ class _Env:
         n_blocks=20,
         policy="write_back",
         high=0.5,
-        low=0.25,
+        low=0.75,
         cache_policy="lru",
         **tier_kw,
     ):
@@ -205,7 +205,7 @@ def test_factory_parses_store_policy(tmp_path):
     tier.shutdown()
     for bad in (
         {"store_policy": "write_around"},
-        {"store_policy": "write_back", "writeback_low_watermark": 0.9},
+        {"store_policy": "write_back", "writeback_low_watermark": 1.0},
         {"store_policy": "write_back", "writeback_high_watermark": 1.5},
     ):
         with pytest.raises(ValueError, match="store_policy|watermark"):
@@ -227,7 +227,7 @@ def test_write_back_needs_iterable_cache_policy(env, monkeypatch):
 
 
 def test_no_store_on_complete_store(env):
-    e = env()  # 20 blocks, high 10, low 5
+    e = env()  # 20 blocks, high 10, cold window 5
     e.store([k(i) for i in range(9)])
     assert not e.jobs() and not e.pinned([k(i) for i in range(9)])
     assert e.wb.dirty == {k(i) for i in range(9)}
@@ -238,7 +238,7 @@ def test_no_store_on_complete_store(env):
 
 
 def test_flush_starts_at_high_and_stops_at_low(env):
-    e = env()  # 20 blocks, high 10, low 5
+    e = env()  # 20 blocks, high 10, cold window 5
     e.store([k(i) for i in range(10)])
     assert not e.jobs()  # nothing before the step's flusher runs
     e.step()
@@ -261,7 +261,7 @@ def test_flush_starts_at_high_and_stops_at_low(env):
 
 
 def test_flushed_blocks_evicted_first_and_not_reflushed(env):
-    e = env()  # 20 blocks, high 10, low 5
+    e = env()  # 20 blocks, high 10, cold window 5
     e.store([k(i) for i in range(10)])
     e.step()
     e.settle()
@@ -269,16 +269,45 @@ def test_flushed_blocks_evicted_first_and_not_reflushed(env):
     assert list(e.policy.evictable_blocks)[:5] == [k(i) for i in range(5)]
     e.store([k(i) for i in range(10, 20)])  # CPU tier now full
     e.step()
-    # 15 unwritten -> down to 5: the 10 coldest unwritten, skipping clean ones
-    assert sorted(key for j in e.jobs() for key in j.keys) == [
-        k(i) for i in range(5, 15)
-    ]
-    e.settle()
+    assert not e.jobs()  # the cold window is clean: nothing to write
     evicted = e.store([k(i) for i in range(20, 25)]).evicted_keys
-    assert len(evicted) == 5 and all(e.tier.is_stored(key) for key in evicted)
+    assert evicted == [k(i) for i in range(5)]  # all already on disk
+    e.step()  # the next 5 victims are written
+    assert [list(j.keys) for j in e.jobs()] == [[k(i) for i in range(5, 10)]]
+    e.settle()
     stats = e.stats()
     assert _M.WRITEBACK_LOST not in stats
-    assert stats[_M.WRITEBACK_FLUSHED] == 15
+    assert stats[_M.WRITEBACK_FLUSHED] == 10
+
+
+def test_promoted_clean_blocks_do_not_starve_the_cold_end(env):
+    """Blocks promoted from the tier arrive clean at the MRU end. However many
+    of them the CPU tier holds, the dirty blocks at the cold end (the next
+    eviction victims) must still be written. Counting dirty blocks against
+    the low watermark instead left the cold end dirty: evicted unwritten."""
+    e = env(high=0.85, low=0.75)  # 20 blocks, high 17, cold window 5
+    promoted = [k(100 + i) for i in range(5)]
+    e.tier.submit_store(make_job(900, promoted, list(range(15, 20))))
+    drain(e.tier)
+    for key in promoted:
+        assert e.manager.lookup(key, e.ctx) is LookupResult.HIT_PENDING
+    e.step()  # submits the promotion (5 blocks used: below high)
+    e.settle()
+    assert not e.jobs()
+    e.store([k(i) for i in range(15)])  # 15 dirty
+    # the request loads its promoted blocks to the GPU: they become MRU
+    spec = e.manager.prepare_load(promoted, e.ctx)
+    assert len(spec.block_ids) == 5
+    e.manager.complete_load(promoted, e.ctx)
+    assert list(e.policy.evictable_blocks)[-5:] == promoted
+    assert len(e.wb.dirty) == 15 and e.primary.num_used_blocks() == 20
+    e.step()
+    written = [key for j in e.jobs() for key in j.keys]
+    assert written == [k(i) for i in range(5)]
+    e.settle()
+    evicted = e.store([k(i) for i in range(20, 25)]).evicted_keys
+    assert evicted == [k(i) for i in range(5)]
+    assert _M.WRITEBACK_LOST not in e.stats()
 
 
 def test_evicting_unwritten_block_counts_lost(env):
@@ -296,7 +325,7 @@ def test_evicting_unwritten_block_counts_lost(env):
 
 def test_backlog_cap_stops_flushing_without_pinning(env, monkeypatch):
     monkeypatch.setattr(tm, "_WRITEBACK_JOB_BLOCKS", 2)
-    e = env(max_inflight_store_bytes=2 * _BS)  # 20 blocks, high 10, low 5
+    e = env(max_inflight_store_bytes=2 * _BS)  # 20 blocks, high 10, cold window 5
     gate = _blocking_store(monkeypatch)
     try:
         e.store([k(i) for i in range(10)])
@@ -359,13 +388,13 @@ def test_failed_write_keeps_blocks_dirty(env, monkeypatch):
 
 
 def test_whole_chunk_all_groups_flushed_together(env):
-    e = env(high=0.5, low=0.45)  # 20 blocks, high 10, low 9
+    e = env(high=0.5, low=0.96)  # 20 blocks, high 10, cold window 1
     # 3 chunks x 4 groups (1 attention + 3 GDN), stored group by group, so
     # the LRU order interleaves chunks: c0g0 c1g0 c2g0 c0g1 ...
     e.store([k(c, g) for g in range(4) for c in range(3)])
     e.step()
-    # 12 unwritten, target 9: the coldest block is c0g0 and its whole chunk
-    # (all 4 groups) goes in one job, although that overshoots by one
+    # cold window of 1: the coldest block is c0g0, and its whole chunk (all 4
+    # groups) goes in one job, although that overshoots the budget
     assert [list(j.keys) for j in e.jobs()] == [[k(0, g) for g in range(4)]]
 
 
@@ -387,7 +416,7 @@ def test_unready_blocks_never_flushed(env):
 
 
 def test_prefix_flushed_with_cold_tail_oldest_first(env):
-    e = env(high=0.3, low=0.15)  # 20 blocks, high 6, low 3
+    e = env(high=0.3, low=0.86)  # 20 blocks, high 6, cold window 3
     chain = [k(c) for c in range(6)]
     e.store(chain)
     # the connector touches a request's keys in chunk order; LRU then holds
@@ -395,7 +424,7 @@ def test_prefix_flushed_with_cold_tail_oldest_first(env):
     e.manager.touch(chain, e.ctx)
     assert list(e.policy.evictable_blocks) == chain[::-1]
     e.step()
-    # 3 blocks needed; the cold pick is c5, but c5 on disk is useless without
+    # budget 3; the cold pick is c5, but c5 on disk is useless without
     # c0..c4 (prefix lookup stops at the first miss): the prefix goes oldest
     # first and the step stops at its budget, the rest follows later
     assert [list(j.keys) for j in e.jobs()] == [chain[:3]]
@@ -409,12 +438,12 @@ def test_one_step_pins_no_more_than_needed(env):
     """A long dirty prefix behind one cold block must not be pinned in one
     step: the flusher stops at its budget (plus at most one chunk's group
     siblings), so the CPU tier keeps enough evictable blocks to store."""
-    e = env(n_blocks=200, high=0.75, low=0.6)  # high 150, low 120
+    e = env(n_blocks=200, high=0.75, low=0.8)  # high 150, cold window 40
     groups = [[k(c, g) for c in range(40)] for g in range(4)]
     e.store([key for group in groups for key in group])  # 160 blocks
     for group in groups:
         e.manager.touch(group, e.ctx)
-    e.step()  # need = 160 - 120 = 40
+    e.step()  # budget: the 40-block cold window
     pinned = [key for j in e.jobs() for key in j.keys]
     assert 40 <= len(pinned) <= 40 + 3
     assert sorted(pinned) == sorted(k(c, g) for c in range(10) for g in range(4))
@@ -423,7 +452,7 @@ def test_one_step_pins_no_more_than_needed(env):
 
 
 def test_prefix_walk_stops_at_block_already_on_disk(env):
-    e = env(high=0.3, low=0.1)  # 20 blocks, high 6, low 2
+    e = env(high=0.3, low=0.86)  # 20 blocks, high 6, cold window 3
     e.tier.submit_store(make_job(900, [k(2)], [19]))  # c2 on disk already
     drain(e.tier)
     chain = [k(c) for c in range(6)]

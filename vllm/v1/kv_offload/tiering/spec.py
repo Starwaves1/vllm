@@ -22,9 +22,10 @@ Configuration via kv_connector_extra_config:
       - store_policy: (optional) "write_through" (default): every block
         stored in the CPU tier is copied to this tier. "write_back": blocks are
         copied only while the CPU tier is filled to writeback_high_watermark
-        (default 0.85, fraction of its blocks), coldest first, until at most
-        writeback_low_watermark (default 0.75) of its blocks are not on this
-        tier. Blocks evicted from the CPU tier before that are not copied.
+        (default 0.85, fraction of its blocks), and only once they are among
+        the coldest 1 - writeback_low_watermark (default 0.75) of its blocks
+        in eviction order. Blocks evicted from the CPU tier before their copy
+        started are not copied.
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 

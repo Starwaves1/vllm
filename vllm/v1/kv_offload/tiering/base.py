@@ -52,8 +52,9 @@ class StorePolicy:
     WRITE_THROUGH = "write_through"
     # Blocks are written only when the primary tier is filling up: once its
     # occupancy reaches ``writeback_high_watermark`` (fraction of its
-    # capacity), the coldest blocks this tier lacks are written until at most
-    # ``writeback_low_watermark`` of the capacity is unwritten ("dirty").
+    # capacity), the blocks this tier lacks are written if they are among the
+    # coldest ``1 - writeback_low_watermark`` of the capacity (in eviction
+    # order), so the next eviction victims are already on this tier.
     WRITE_BACK = "write_back"
 
 
@@ -179,10 +180,10 @@ class SecondaryTierManager(ABC):
             if writeback_low_watermark is None
             else float(writeback_low_watermark)
         )
-        if not 0.0 <= low < high <= 1.0:
+        if not (0.0 <= low < 1.0 and 0.0 < high <= 1.0):
             raise ValueError(
-                "write-back watermarks need 0 <= writeback_low_watermark < "
-                f"writeback_high_watermark <= 1, got low={low}, high={high}"
+                "write-back watermarks need 0 <= writeback_low_watermark < 1 and "
+                f"0 < writeback_high_watermark <= 1, got low={low}, high={high}"
             )
         self.store_policy = store_policy
         self.writeback_high_watermark = high
