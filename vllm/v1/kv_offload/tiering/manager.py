@@ -81,6 +81,15 @@ class JobMetadata(NamedTuple):
     tier_idx: int
 
 
+def _request_key_groups(req_context: ReqContext) -> list[list[OffloadKey]]:
+    """The request's recorded keys, one list per KV cache group, in prefix
+    order (by the end-token positions the connector records)."""
+    groups: dict[bytes, list[tuple[int, OffloadKey]]] = {}
+    for key, position in req_context.get_offload_key_positions().items():
+        groups.setdefault(key[-4:], []).append((position, key))
+    return [[key for _, key in sorted(group)] for group in groups.values()]
+
+
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     """CPUOffloadingManager with a primary/secondary transfer interface.
 
@@ -821,9 +830,28 @@ class TieringOffloadingManager(OffloadingManager):
         exclude_tier_idx: int | None = None,
     ) -> None:
         self.primary_tier.on_request_finished(req_context)
+        self._touch_request_keys(req_context, exclude_tier_idx)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier_idx)
+
+    def _touch_request_keys(
+        self, req_context: ReqContext, exclude_tier_idx: int | None = None
+    ) -> None:
+        """Pass the request's keys to the secondary tiers' touch(), per KV
+        cache group in prefix order.
+
+        The connector no longer calls touch(): request recency is applied
+        once, when the request finishes (#51787). This is where a tier that
+        keeps its own recency (the bounded fs tier) learns which chunks a
+        request used.
+        """
+        if not self.secondary_tiers:
+            return
+        for keys in _request_key_groups(req_context):
+            for tier_idx, tier in enumerate(self.secondary_tiers):
+                if tier_idx != exclude_tier_idx:
+                    tier.touch(keys, req_context)
 
     def _maybe_finalize_request(
         self,
