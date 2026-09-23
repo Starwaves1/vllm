@@ -320,9 +320,14 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+        # Clamp at 0: when req_blocks already covers the computed range (e.g. a
+        # local prefix hit whose blocks span past the external boundary) the
+        # difference can go negative. Backport of upstream PR #52707; the
+        # 0.27.1 wheel lacks this guard and get_new_blocks(<0) is undefined.
+        num_new_blocks = max(
+            0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
+        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
@@ -1549,7 +1554,55 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+
+            # INVARIANT: get_num_blocks_to_allocate must count every block that
+            # allocate_new_computed_blocks (add_local_computed_blocks +
+            # allocate_external_computed_blocks) AND allocate_new_blocks will
+            # pull for this group. `num_new_blocks` above covers only
+            # allocate_new_blocks (state + speculative [+ partial-hit CoW]); it
+            # omitted the KV-connector-loaded (external) range that the
+            # *inherited* base allocate_external_computed_blocks pulls. At a
+            # near-full pool that undercount made the final allocate_new_blocks
+            # raise "Cannot get N free blocks from the pool" and kill the engine
+            # (production 2026-09-22, 98.5% KV usage, sync-load admission).
+            #
+            # Mirror the base allocate_external_computed_blocks arithmetic
+            # exactly. add_local_computed_blocks runs first and pads this
+            # group's req_to_blocks with `max(num_skipped_blocks, len(
+            # new_computed_blocks))` entries (num_skipped_blocks null
+            # placeholders for the states Mamba no longer needs, plus the
+            # un-skipped local-hit blocks), so the external range is only what
+            # cdiv(total) exceeds that -- which collapses to a single state
+            # block for a full external prefix, never the whole prefix. Only a
+            # first allocation reaches allocate_external (running requests are
+            # short-circuited in the coordinator), so gate on _allocated_block_reqs.
+            num_external_computed_tokens = (
+                total_computed_tokens - num_local_computed_tokens
+            )
+            num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+            if num_skipped_tokens > 0:
+                # Base allocate_external_computed_blocks' early-return gate.
+                num_external_computed_tokens = min(
+                    total_computed_tokens - num_skipped_tokens,
+                    num_external_computed_tokens,
+                )
+            num_external_blocks = 0
+            if (
+                num_external_computed_tokens > 0
+                and request_id not in self._allocated_block_reqs
+            ):
+                num_skipped_blocks = num_skipped_tokens // self.block_size
+                num_req_blocks_after_local = len(
+                    self.req_to_blocks[request_id]
+                ) + max(num_skipped_blocks, len(new_computed_blocks))
+                num_external_blocks = max(
+                    cdiv(total_computed_tokens, self.block_size)
+                    - num_req_blocks_after_local,
+                    0,
+                )
+            return (
+                num_new_blocks + num_evictable_computed_blocks + num_external_blocks
+            )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
