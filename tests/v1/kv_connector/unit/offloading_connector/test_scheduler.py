@@ -78,18 +78,20 @@ def test_scheduler_reports_allocation_failure(request_runner):
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
 @pytest.mark.parametrize("prompt_offset", [-1, -2])
-def test_last_block_offloaded_at_request_finish(
+def test_final_sampled_token_does_not_complete_an_offloaded_block(
     request_runner, async_scheduling: bool, prompt_offset: int
 ):
-    """EOS fills the last block at request finish - verify the final block is stored.
+    """A block whose last slot holds the final sampled token is not stored.
 
-    prompt = block_size + prompt_offset tokens → not a full block at schedule time,
-    so _build_store_jobs creates no store job. After EOS, request_finished
-    keeps req_status alive so _build_store_jobs can process it on the next step.
+    That token came out of the previous position's forward pass; its own KV
+    slot is never written, and under spec decode it holds the first rejected
+    draft's KV. Storing the block would publish it under a content hash that
+    the GPU prefix cache itself declines to commit, so a later request with
+    the same tokens would load the unwritten slot.
 
-    prompt_offset=-1: EOS fills the block → store job created on next step.
-    prompt_offset=-2: block remains partial → no store job, cleanup in
-    _build_store_jobs deletes req_status.
+    prompt = 2 * block_size + prompt_offset tokens. Block 0 is filled by
+    prefill and stored either way. At prompt_offset=-1 the EOS fills block 1,
+    which the finishing step must still decline; at -2 block 1 stays partial.
     """
     block_size = 4
     runner = request_runner(
@@ -97,18 +99,11 @@ def test_last_block_offloaded_at_request_finish(
         num_gpu_blocks=10,
         async_scheduling=async_scheduling,
     )
-    # prompt = block_size + prompt_offset tokens
-    runner.new_request(token_ids=[0] * (block_size + prompt_offset))
+    runner.new_request(token_ids=[0] * (2 * block_size + prompt_offset))
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(list(keys))
     )
-
-    if prompt_offset == -1:
-        # EOS fills the block, so a store job is created for block 0.
-        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
-    else:
-        # Block remains partial, so no store job is created.
-        runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
 
     cs = runner.connector_scheduler
     # After the full run completes, req_status is cleaned up.
@@ -650,10 +645,13 @@ def test_on_request_finished_not_deferred_until_store_completion(
 def test_on_request_finished_fires_after_final_block_store(
     request_runner, async_scheduling: bool
 ):
-    """on_request_finished fires after the final-block prepare_store at EOS.
+    """on_request_finished fires after the final prepare_store of the request.
 
-    When EOS fills a partial block, request_finished() keeps req_status alive
-    so _build_store_jobs can create a store job for it on the next step.
+    request_finished() keeps req_status alive so _build_store_jobs can retry a
+    block on the next step; the retry must be issued before the manager is told
+    the request is over. Every attempt made before the request finishes is
+    declined here, so the store that succeeds is the one from the finishing
+    step and the ordering has something to order.
     """
     block_size = 4
     runner = request_runner(
@@ -667,22 +665,31 @@ def test_on_request_finished_fires_after_final_block_store(
         ("on_request_finished", req_context.req_id)
     )
 
+    runner.new_request(token_ids=[0] * block_size)
+    request = runner.scheduler.requests[str(runner.req_id)]
+
     def prepare_store(keys, req_context):
-        calls.append(("prepare_store", req_context.req_id))
-        return generate_store_output(keys)
+        finished = request.is_finished()
+        calls.append(
+            ("stored_after_finish" if finished else "prepare_store", req_context.req_id)
+        )
+        return generate_store_output(keys) if finished else None
 
     runner.manager.prepare_store.side_effect = prepare_store
 
-    runner.new_request(token_ids=[0] * (block_size - 1))
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
 
     req_id = str(runner.req_id)
     assert calls.count(("on_request_finished", req_id)) == 1, calls
+    assert calls.count(("stored_after_finish", req_id)) == 1, calls
 
     finished_idx = calls.index(("on_request_finished", req_id))
-    prepare_indices = [i for i, c in enumerate(calls) if c == ("prepare_store", req_id)]
-    assert prepare_indices, calls
-    assert finished_idx > max(prepare_indices), calls
+    store_indices = [
+        i
+        for i, c in enumerate(calls)
+        if c in (("prepare_store", req_id), ("stored_after_finish", req_id))
+    ]
+    assert finished_idx > max(store_indices), calls
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -873,10 +880,9 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     touch_calls = runner.manager.touch.call_args_list
     assert len(touch_calls) == 6
 
-    # EOS fills the 7th block (offset 6). The extra schedule step processes
-    # finished_req_ids and stores block 6 for both groups before the request's
-    # GPU blocks are freed.
-    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(6,))
+    # EOS lands in the last slot of the 7th block (offset 6). No forward pass
+    # writes that slot, so the finishing step declines the block.
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     runner.scheduler.reset_prefix_cache()
 
@@ -2555,8 +2561,9 @@ class TestEagle:
 
         Groups: 0=non-eagle full-attn, 1=eagle full-attn.
         Group 0 has only 1 hit (out of 3 keys) → max_hit tightens to 4.
-        This clears eagle_verified. Group 1 runs with max_hit=4 → only 1
-        key queried, 1 hit, pop to 0 → returns 0.
+        This clears eagle_verified. Group 1 runs with max_hit=4 → widened
+        query of 2 keys, 2 hits, pop to 1 → the confirmed boundary holds
+        at 4 tokens.
         """
         block_size = 4
         groups = [
@@ -2601,9 +2608,12 @@ class TestEagle:
             offload_keys_per_group=[[10, 11, 12], [1, 2, 3]],
         )
         # Group 0 (non-eagle FA): prefix finds 1 hit → max_hit=4, num_hit=4
-        # Group 1 (eagle FA): max_hit=4 → num_blocks=1, keys=[1].
-        #   Finds 1 hit, pop to 0 → new_num_hit = 0 < block_size → return 0
-        assert sched._lookup(req_status) == 0
+        # Group 1 (eagle FA): max_hit=4, widened query → keys=[1, 2].
+        #   Finds 2 hits, pop to 1 → boundary stays at 4 tokens. Before the
+        #   #52735 fix the query was not widened for full-attention groups,
+        #   so the pop landed on the only queried chunk and zeroed the
+        #   whole request.
+        assert sched._lookup(req_status) == 4
 
     def test_eagle_verified_survives_eagle_tighten(self, request_runner):
         """Eagle group tightening does NOT clear eagle_verified.
@@ -2719,10 +2729,12 @@ class TestEagle:
         runner.manager.prepare_store.side_effect = lambda keys, req_context: (
             generate_store_output(keys)
         )
-        # 4 decoded tokens fill block 3 entirely with decode tokens (one
-        # extra token so the block is stored under async scheduling too).
+        # 4 decoded tokens fill block 3; the extra decode steps let its store
+        # job complete within this run under both scheduling modes. The
+        # eagle group holds back its volatile trailing block (1, 3) while the
+        # request is still decoding, while the normal group stores (0, 3).
         runner.run(
-            decoded_tokens=[1, 1, 1, 1, 1, EOS_TOKEN_ID],
+            decoded_tokens=[1, 1, 1, 1, 1, 1, 1],
             expected_stored=(
                 (0, 0),
                 (0, 1),
@@ -2732,6 +2744,13 @@ class TestEagle:
                 (1, 1),
                 (1, 2),
             ),
+        )
+        # Once the request finishes, no spec rejection can rewrite the tail,
+        # so the exclusion is lifted (issue #52735): the held-back (1, 3) and
+        # the just-completed block 4 are stored for both groups.
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((1, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -2774,10 +2793,16 @@ class TestEagle:
         runner.manager.prepare_store.side_effect = lambda keys, req_context: (
             generate_store_output(keys)
         )
-        # 4 decoded tokens fill block 3 entirely with decode tokens.
+        # 4 decoded tokens fill block 3 entirely with decode tokens. The
+        # eagle group holds back its volatile trailing block while decoding.
         runner.run(
-            decoded_tokens=[1, 1, 1, 1, EOS_TOKEN_ID],
+            decoded_tokens=[1, 1, 1, 1],
             expected_stored=((0, 0), (0, 1), (0, 2)),
+        )
+        # Finish lifts the exclusion; the tail block is stored (issue #52735).
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((0, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
