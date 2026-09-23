@@ -1124,6 +1124,19 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if num_external_computed_tokens > 0 and self.needs_kv_cache_zeroing:
+                    # Sync KV load (load_kv_async is False here): the connector
+                    # fills these blocks for this step, possibly before the
+                    # worker runs this step's zeroing (the OffloadingConnector
+                    # lands sync loads in handle_preemptions), so zeroing
+                    # would wipe the loaded KV. Skip them like async loads.
+                    self._skip_zero_block_ids.update(
+                        self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                            request.request_id,
+                            num_new_local_computed_tokens,
+                            num_computed_tokens,
+                        )
+                    )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp

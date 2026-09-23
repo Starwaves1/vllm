@@ -373,9 +373,12 @@ class SingleDirectionOffloadingHandler:
             else torch.Event(enable_timing=True)
         )
 
-        if self.gpu_to_cpu:
-            # wait for model computation to finish before offloading
-            stream.wait_stream(current_platform.current_stream())
+        # Stores must wait for the model to finish writing the KV they read.
+        # Loads must wait for pending compute-stream writes (including
+        # zeroing) to their destination blocks; otherwise the load can be
+        # overwritten by work that was already queued when it began
+        # (backport of upstream #50696 / 1ab2801dd).
+        stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event

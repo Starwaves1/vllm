@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
+    TransferJob,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     is_kv_cache_tensor_packed,
@@ -61,6 +62,9 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
+        # Sync load jobs of the current step already submitted and waited in
+        # handle_preemptions; start_kv_transfers skips them.
+        self._sync_loaded_job_ids: set[int] = set()
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
@@ -316,6 +320,28 @@ class OffloadingConnectorWorker:
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
+        self._sync_loaded_job_ids = set()
+        if self.spec.sync_load and kv_connector_metadata.load_jobs:
+            # Sync loads must land before the model runner prepares this
+            # step's inputs, not just before the forward: _update_states
+            # queues zeroing of new blocks and preprocess_mamba (align mode)
+            # copies the SSM state out of block (num_computed_tokens - 1) //
+            # block_size, i.e. a sync load's destination, both on the compute
+            # stream and both before start_load_kv. handle_preemptions runs
+            # ahead of all of them, after the stores/flush above. The
+            # scheduler skips zeroing the loaded blocks.
+            self._submit_loads(kv_connector_metadata.load_jobs)
+            self.worker.wait(set(kv_connector_metadata.load_jobs))
+            self._sync_loaded_job_ids = set(kv_connector_metadata.load_jobs)
+
+    def _submit_loads(self, load_jobs: dict[int, TransferJob]):
+        assert self.worker is not None
+        for job_id, entry in load_jobs.items():
+            self._load_jobs[job_id] = entry.req_id
+            assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+            assert success
+
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
@@ -323,17 +349,21 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
-        for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
-            assert isinstance(entry.dst_spec, GPULoadStoreSpec)
-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
-            assert success
+        load_jobs = metadata.load_jobs
+        if self._sync_loaded_job_ids:
+            # Already submitted and waited in handle_preemptions.
+            load_jobs = {
+                job_id: entry
+                for job_id, entry in load_jobs.items()
+                if job_id not in self._sync_loaded_job_ids
+            }
+            self._sync_loaded_job_ids = set()
+        self._submit_loads(load_jobs)
 
-        if self.spec.sync_load and metadata.load_jobs:
-            # Sync loads feed this step's forward pass (start_load_kv runs
-            # before the forward on the model runner), so block until the
-            # KV data has landed.
-            self.worker.wait(set(metadata.load_jobs))
+        if self.spec.sync_load and load_jobs:
+            # Fallback for a runner that did not call handle_preemptions
+            # first: block until the KV data has landed.
+            self.worker.wait(set(load_jobs))
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -402,6 +432,7 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._sync_loaded_job_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()
