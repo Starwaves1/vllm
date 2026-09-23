@@ -108,6 +108,7 @@ def _compute_global_target_argmax(
         mask=blocks_mask,
         other=float("-inf"),
     )
+    local_max = tl.where(local_max != local_max, float("-inf"), local_max)
     max_block_idx = tl.argmax(local_max, axis=0)
     return tl.load(
         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
@@ -848,6 +849,9 @@ def _insert_resampled_kernel(
         resampled_local_max_ptr + req_idx * resampled_local_max_stride + block,
         mask=mask,
         other=float("-inf"),
+    )
+    resampled_local_max = tl.where(
+        resampled_local_max != resampled_local_max, float("-inf"), resampled_local_max
     )
     resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
     resampled = tl.load(

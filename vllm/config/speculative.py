@@ -1361,6 +1361,9 @@ class SpeculativeConfig:
         when drafting.
         """
         slots_per_req = 0  # for serial non-draft-model methods, no change needed
+        if self.method == "dflash":
+            # DFlash uses one bonus query followed by K mask queries (vLLM main).
+            return self.num_speculative_tokens
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
             slots_per_req = self.num_speculative_tokens - 1

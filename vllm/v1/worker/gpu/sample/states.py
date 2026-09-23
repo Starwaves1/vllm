@@ -109,7 +109,14 @@ class SamplingStates:
         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
         if top_k is None and top_p is None:
             return logits
-        return apply_top_k_top_p(logits, top_k, top_p)
+        return apply_top_k_top_p(logits, top_k, top_p, self.top_k_max(idx_mapping_np))
+
+    def top_k_max(self, idx_mapping_np: np.ndarray) -> int | None:
+        # Largest top_k in the batch (host-side), for the sort-free small-k path.
+        ks = self.top_k.np[idx_mapping_np]
+        if ks.size == 0 or np.any(ks == self.vocab_size):
+            return None
+        return int(ks.max())
 
     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:
         return bool(np.any(self.temperature.np[idx_mapping_np] == 0.0))

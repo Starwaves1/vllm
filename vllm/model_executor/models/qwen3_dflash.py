@@ -56,10 +56,13 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    """Resolve explicit causality before falling back to legacy layer defaults."""
+    is_causal = getattr(config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
-        return override
+        return bool(override)
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -342,8 +345,31 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+    """Rows [q_size:] of the qkv projection as a dense bf16 matrix. For a compressed-tensors
+    W4A16/W8A16 (pack-quantized, symmetric, group) qkv_proj this is called from load_weights,
+    i.e. before the Marlin repack, so weight_packed/weight_scale are still in the plain
+    checkpoint layout and can be dequantized here."""
+    qkv = attn.qkv_proj
+    w = getattr(qkv, "weight", None)
+    if w is not None and w.dim() == 2:
+        return w[attn.q_size :]
+    packed, scale = qkv.weight_packed, qkv.weight_scale
+    # (weight_shape holds only the last-loaded shard of a fused qkv; use the tensors.)
+    out_f, in_f = int(packed.shape[0]), int(qkv.input_size)
+    bits = 32 * packed.shape[1] // in_f
+    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
+    q = unpack_from_int32(packed.data, bits, torch.Size([out_f, in_f]), packed_dim=1)
+    group = in_f // scale.shape[1]
+    dense = (q.to(torch.float32).reshape(out_f, in_f // group, group)
+             * scale.to(torch.float32)[..., None]).reshape(out_f, in_f)
+    return dense.to(scale.dtype if scale.dtype.is_floating_point else torch.bfloat16)[attn.q_size :]
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={"midlayer.": "layers.0."},
         orig_to_new_stacked={
@@ -397,7 +423,7 @@ class DFlashQwen3Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -445,7 +471,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -662,6 +688,8 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -671,7 +699,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
