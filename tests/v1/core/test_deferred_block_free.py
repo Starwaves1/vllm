@@ -544,3 +544,64 @@ def test_cow_retentions_deferred_until_copy_step_processed():
     assert not scheduler.deferred_frees
     out2 = scheduler.schedule()
     assert [r.req_id for r in out2.scheduled_new_reqs] == ["late"]
+
+
+def test_pending_cow_fence_does_not_pin_satisfied_frees_behind_it():
+    """A CoW retention fence recorded by a schedule that ends with 0 tokens
+    leads the request-free fences queued behind it. The drain must still free
+    every entry whose own fence has been processed: stopping at the first
+    pending fence pins blocks that admission needs, and at pool exhaustion no
+    productive step ever runs to satisfy the head, so the scheduler deadlocks.
+    """
+    scheduler = create_scheduler(model=MODEL, async_scheduling=False)
+    scheduler.defer_block_free = True
+    pool = scheduler.kv_cache_manager.block_pool
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+
+    request = create_requests(
+        num_requests=1, num_tokens=NUM_PROMPT_TOKENS, max_tokens=5
+    )[0]
+    scheduler.add_request(request)
+    out0 = scheduler.schedule()  # productive step 1, in flight
+    assert scheduler.sched_step_seq == 1
+
+    # A CoW copy rides a schedule that ends with 0 tokens: its retention fence
+    # is the next productive step (2), which does not exist yet.
+    src_block, dst_block = pool.get_new_blocks(2)
+    manager._pending_cow_copies.append((src_block, dst_block))
+    out1 = scheduler.schedule()
+    assert out1.total_num_scheduled_tokens == 0
+    assert out1.kv_cache_block_copies
+    assert [fence for fence, _ in scheduler.deferred_frees] == [2]
+
+    # Abort while step 1 is in flight: the request's fence (1) queues behind
+    # the CoW fence.
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert [fence for fence, _ in scheduler.deferred_frees] == [2, 1]
+
+    # Exhaust the pool: the aborted request's blocks are all a new request
+    # can get.
+    pool.get_new_blocks(pool.get_num_free_blocks())
+    late_request = create_requests(
+        num_requests=1,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=5,
+        req_ids=["late"],
+    )[0]
+    scheduler.add_request(late_request)
+
+    # Step 1's output frees the aborted request's blocks even though the CoW
+    # retention ahead of it still waits for step 2.
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert [fence for fence, _ in scheduler.deferred_frees] == [2]
+    assert src_block.ref_cnt == 1
+    assert dst_block.ref_cnt == 1
+
+    # The freed blocks admit the late request; its step is the CoW fence.
+    out2 = scheduler.schedule()
+    assert [r.req_id for r in out2.scheduled_new_reqs] == ["late"]
+    scheduler.update_from_output(out2, _make_model_runner_output(out2))
+    assert not scheduler.deferred_frees
+    assert src_block.ref_cnt == 0
+    assert dst_block.ref_cnt == 0
