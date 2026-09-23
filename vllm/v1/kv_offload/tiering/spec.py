@@ -26,10 +26,10 @@ Configuration via kv_connector_extra_config:
       - store_policy: (optional) "write_through" (default): every chunk
         stored in the CPU tier is copied to this tier. "write_back": chunks
         are copied only while the CPU tier is filled to
-        writeback_high_watermark (default 0.85, fraction of its chunks),
-        coldest first, until at most writeback_low_watermark (default 0.75)
-        of its chunks are not on this tier. Chunks evicted from the CPU tier
-        before that are not copied.
+        writeback_high_watermark (default 0.85, fraction of its chunks), and
+        only once they are among the coldest 1 - writeback_low_watermark
+        (default 0.75) of its chunks in eviction order. Chunks evicted from the
+        CPU tier before their copy started are not copied.
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 

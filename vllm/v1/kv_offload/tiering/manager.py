@@ -24,6 +24,7 @@ high watermark, the coldest chunks such a tier lacks are written to it (see
 _writeback_step), so a chunk evicted later is still on the secondary tier.
 """
 
+import itertools
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -87,8 +88,8 @@ class _WritebackState:
 
     tier: SecondaryTierManager
     tier_idx: int
-    # Primary-tier occupancy (chunks) at which flushing starts, and the number
-    # of unwritten chunks it flushes down to.
+    # Primary-tier occupancy (chunks) at which flushing starts; the coldest
+    # (num_chunks - low_chunks) evictable chunks are kept written.
     high_chunks: int
     low_chunks: int
     # Chunks in the primary tier that this tier does not hold yet. Includes
@@ -1024,34 +1025,35 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _writeback_step(self, wb: _WritebackState) -> None:
         """Once per scheduler step. While the primary tier holds at least
-        ``high_chunks`` chunks, write the coldest unwritten chunks (in the
-        primary's eviction order) to ``wb.tier`` until at most ``low_chunks``
-        are left unwritten, or the tier declines (store backlog cap, breaker).
-        Eviction itself never waits: a chunk evicted before its write
-        started is lost to the tier (counted in writeback_lost_blocks)."""
+        ``high_chunks`` chunks, keep its cold end on ``wb.tier``: write the
+        unwritten chunks among the coldest ``num_chunks - low_chunks``
+        evictable chunks (the next eviction victims), until the tier declines
+        (store backlog cap, breaker). Chunks elsewhere, e.g. just promoted
+        from the tier, don't count: only the cold end is about to be evicted.
+        Eviction itself never waits: a chunk evicted before its write started
+        is lost to the tier (counted in writeback_lost_blocks)."""
         primary = self.primary_tier
         if primary.num_used_chunks() < wb.high_chunks:
             return
-        need = len(wb.dirty) - len(wb.flushing) - wb.low_chunks
-        if need <= 0:
-            return
+        window = primary.num_chunks - wb.low_chunks
+        # Write-back never pins more than the cold window.
+        budget = window - len(wb.flushing)
         # Plan first: pinning below changes the evictable set being iterated.
-        # A unit is taken oldest chunk first and cut off once ``need`` chunks
-        # are planned (overshooting by at most one chunk's group siblings);
-        # the rest of a long prefix follows on later steps, so one step never
-        # pins much more than it has to.
+        # A unit is taken oldest chunk first and cut off at the budget
+        # (overshooting by at most one chunk's group siblings); the rest of a
+        # long prefix follows on later steps.
         units: list[list[OffloadKey]] = []
         taken: set[OffloadKey] = set()
-        for key in primary.iter_evictable():
+        for key in itertools.islice(primary.iter_evictable(), window):
+            if budget <= 0:
+                break
             if key not in wb.dirty or key in taken or key in wb.flushing:
                 continue
             for unit in self._plan_writeback_unit(wb, key, taken):
-                if need <= 0:
+                if budget <= 0:
                     break
                 units.append(unit)
-                need -= len(unit)
-            if need <= 0:
-                break
+                budget -= len(unit)
         # Submit oldest prefix chunks first, in jobs of about
         # _WRITEBACK_JOB_CHUNKS; a chunk's group siblings share a job.
         batch: list[OffloadKey] = []
