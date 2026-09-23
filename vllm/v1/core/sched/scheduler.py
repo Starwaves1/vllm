@@ -74,6 +74,12 @@ logger = init_logger(__name__)
 # in-flight prefill's reservation draining, blocks freeing next step) so a load
 # that could still be admitted is not abandoned prematurely. The exact value is
 # not sensitive; anything in ~4-16 behaves identically here.
+#
+# Stage 2: the count only advances while the engine is IDLE (nothing running
+# and no async KV load in flight, so no block will ever be freed). While the
+# engine is BUSY the candidate keeps its hit and waits at the FCFS head, as
+# upstream does: blocks will free. Abandoning busy-engine hits after ~0.3 s
+# recomputed ~90% of offloaded prefixes at concurrency >= 3.
 ASYNC_LOAD_ADMIT_MAX_FAILS = 8
 
 
@@ -341,9 +347,11 @@ class Scheduler(SchedulerInterface):
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
         # BUG #2: per-request count of consecutive engine steps an async
-        # KV-load candidate failed the full-ISL admission reservation. Once it
-        # reaches ASYNC_LOAD_ADMIT_MAX_FAILS the request abandons the offloaded
-        # load and recomputes locally. Cleared on admission or finish.
+        # KV-load candidate failed the full-ISL admission reservation while
+        # the engine was IDLE (see _async_load_engine_busy). Once it reaches
+        # ASYNC_LOAD_ADMIT_MAX_FAILS the request abandons the offloaded load
+        # and recomputes locally. Cleared on admission, on finish, and on any
+        # failure while the engine is busy (the busy wait never degrades).
         self._async_load_admit_fails: dict[str, int] = {}
 
         self.perf_metrics: ModelMetrics | None = None
@@ -866,6 +874,15 @@ class Scheduler(SchedulerInterface):
                     # needs no connector notification: the later
                     # update_state_after_alloc(..., 0) is a no-op.
                     if load_kv_async and self._should_degrade_async_load(request_id):
+                        logger.warning(
+                            "Async KV load for request %s failed admission for "
+                            "%d consecutive steps with the engine idle (nothing "
+                            "running, no load in flight); dropping its %d "
+                            "external tokens and recomputing locally.",
+                            request_id,
+                            self._async_load_admit_fails.get(request_id, 0),
+                            num_external_computed_tokens,
+                        )
                         degraded_async_load = True
                         load_kv_async = False
                         num_external_computed_tokens = 0
@@ -2730,19 +2747,42 @@ class Scheduler(SchedulerInterface):
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
 
+    def _async_load_engine_busy(self) -> bool:
+        """BUG #2: whether blocks are guaranteed to be freed later.
+
+        True while any request is running (it finishes or is preempted, both of
+        which free blocks) or an async KV load is in flight (it lands, runs and
+        finishes). Then an async-load candidate that does not fit yet keeps its
+        hit and waits. Only an idle engine can hold a candidate that will never
+        fit, which is the livelock the degrade path exists for.
+        """
+        return bool(self.running) or any(
+            req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            for req in self._inflight_prefills
+        )
+
     def _note_async_load_admit_failure(self, request_id: str) -> None:
-        """BUG #2: record one more consecutive async-load admission failure."""
+        """BUG #2: record one more consecutive async-load admission failure.
+
+        Failures while the engine is busy do not count, and they reset the
+        count: degrading needs N consecutive failures with the engine idle.
+        """
+        if self._async_load_engine_busy():
+            self._async_load_admit_fails.pop(request_id, None)
+            return
         self._async_load_admit_fails[request_id] = (
             self._async_load_admit_fails.get(request_id, 0) + 1
         )
 
     def _should_degrade_async_load(self, request_id: str) -> bool:
         """BUG #2: whether an async-load candidate has failed admission enough
-        consecutive steps to abandon the load and recompute the suffix locally.
+        consecutive idle-engine steps to abandon the load and recompute the
+        suffix locally. Never while the engine is busy: blocks will free.
         """
         return (
             self._async_load_admit_fails.get(request_id, 0)
             >= ASYNC_LOAD_ADMIT_MAX_FAILS
+            and not self._async_load_engine_busy()
         )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
