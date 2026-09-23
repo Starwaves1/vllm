@@ -329,6 +329,12 @@ class OffloadingConnectorWorker:
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
+        if self.spec.sync_load and metadata.load_jobs:
+            # Sync loads feed this step's forward pass (start_load_kv runs
+            # before the forward on the model runner), so block until the
+            # KV data has landed.
+            self.worker.wait(set(metadata.load_jobs))
+
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
             if not self._is_store_writer:
@@ -375,7 +381,12 @@ class OffloadingConnectorWorker:
 
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            if req_id is not None and not self.spec.sync_load:
+                # Sync loads complete within the step that scheduled the
+                # request; it was never parked in WAITING_FOR_REMOTE_KVS, so
+                # reporting finished_recving would hit the base scheduler's
+                # aborted-during-load path. Job completion still reaches the
+                # scheduler side via completed_jobs above.
                 finished_recving.add(req_id)
 
         return set(), finished_recving

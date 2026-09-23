@@ -164,6 +164,9 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    # Load hits synchronously (see OffloadingSpec.sync_load): the request
+    # admits like a plain request and the worker blocks in start_load_kv.
+    sync_load: bool
 
     @classmethod
     def from_spec(
@@ -226,6 +229,16 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
+        group_block_sizes = set(spec.tokens_per_block)
+        if spec.sync_load and len(group_block_sizes) != 1:
+            # Sync loads locate each group's load boundary positionally from
+            # token counts (update_state_after_alloc), which is only exact
+            # when every group's block list uses the same tokens_per_block.
+            raise ValueError(
+                "sync_load requires all KV cache groups to share one block "
+                f"size; got block sizes {sorted(group_block_sizes)}"
+            )
+
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -255,6 +268,7 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            sync_load=spec.sync_load,
         )
 
 
@@ -639,10 +653,12 @@ class OffloadingConnectorScheduler:
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
-        if self._sliding_window_groups:
+        if self._sliding_window_groups or self.config.sync_load:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
+            # we still have a hit after reduction. A sync load likewise must
+            # leave at least one token to compute in the scheduling step
+            # (async loads instead recompute it when the request unparks).
             max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
@@ -868,6 +884,11 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
+        if self.config.sync_load:
+            # The hit is loaded during this step's start_load_kv, before the
+            # forward pass: the request admits and schedules like a plain
+            # request instead of parking in WAITING_FOR_REMOTE_KVS.
+            return num_hit_tokens, False
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
@@ -902,11 +923,31 @@ class OffloadingConnectorScheduler:
 
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
-                if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
-                    break
+            if self.config.sync_load:
+                # A sync load's blocks are cached (hashed) by allocate_slots
+                # before this call, so the block-hash probe below cannot
+                # locate the load boundary. Derive it positionally instead:
+                # sync_load requires a uniform block size, so entry i of
+                # every group's block list covers tokens
+                # [i * tokens_per_block, (i + 1) * tokens_per_block), and the
+                # locally-computed prefix is block-aligned. Then skip leading
+                # null placeholders exactly like the probe does.
+                num_locally_computed_gpu_blocks = min(
+                    num_locally_computed_tokens // tokens_per_block,
+                    num_gpu_blocks,
+                )
+                while (
+                    num_locally_computed_gpu_blocks < num_gpu_blocks
+                    and group_blocks[num_locally_computed_gpu_blocks].is_null
+                ):
+                    num_locally_computed_gpu_blocks += 1
+            else:
+                # Skip null placeholder blocks
+                # (used for sliding window or mamba padding).
+                for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+                    if not block.is_null and block.block_hash is None:
+                        num_locally_computed_gpu_blocks = i
+                        break
 
             assert (
                 num_locally_computed_tokens
@@ -1172,8 +1213,18 @@ class OffloadingConnectorScheduler:
             dst_spec = store_output.store_spec
 
             job_id = self._generate_job_id()
-            # a store can only be issued when no load is pending.
-            if req_status.transfer_jobs:
+            # a store can only be issued when no ASYNC load is pending: an
+            # async-loading request is parked out of num_scheduled_tokens, so
+            # a pending load job here would mean corrupted accounting. A SYNC
+            # load job is expected instead: the request schedules (and can
+            # produce newly-storable chunks, e.g. the computed tail past a
+            # partial hit) in the very step that issued its load job, and the
+            # job lingers in transfer_jobs until the worker's completion ack
+            # lands. This is safe: the load is host-blocking and completes
+            # before its step's forward pass, while store submission is
+            # deferred to the next step's start_kv_transfers, so a store can
+            # never copy blocks its request's load has not yet filled.
+            if req_status.transfer_jobs and not self.config.sync_load:
                 any_jid = next(iter(req_status.transfer_jobs))
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
@@ -1229,6 +1280,18 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None or not req_status.transfer_jobs:
+                continue
+            if self.config.sync_load:
+                # A sync load job may linger in transfer_jobs until its
+                # completion ack even though the transfer itself finished
+                # before its step's forward pass (host-blocking wait), so it
+                # needs no flush; only pending stores must be flushed before
+                # the preempted request's blocks are reused.
+                self._current_batch_jobs_to_flush.update(
+                    jid
+                    for jid in req_status.transfer_jobs
+                    if self._jobs[jid].is_store
+                )
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store
