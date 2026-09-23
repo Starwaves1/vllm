@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 """
 
 import functools
+import os
 import gc
 import time
 from copy import deepcopy
@@ -748,6 +749,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def profile_cudagraph_memory(self) -> int:
         # NOTE(woosuk): It is TBD whether we keep this API or not.
+        # (syv) Until V2 profiles its graphs like V1 does, reserve an explicit,
+        # measured amount so gpu_memory_utilization covers them instead of the
+        # graphs landing on top of the KV cache. Read the figure from the
+        # "... GiB for CUDAGraph memory" line of a previous start.
+        reserve_mib = float(os.environ.get("VLLM_V2_CUDAGRAPH_MEM_MIB", "0") or 0)
+        if reserve_mib > 0 and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            reserve = int(reserve_mib * 1024 * 1024)
+            logger.info(
+                "Reserving %.2f GiB for CUDA graphs before sizing the KV cache "
+                "(VLLM_V2_CUDAGRAPH_MEM_MIB)",
+                reserve / 2**30,
+            )
+            return reserve
         return 0
 
     @torch.inference_mode()
