@@ -1115,9 +1115,9 @@ class OffloadingConnectorScheduler:
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         if self.config.sync_load:
-            # The hit is loaded during this step's start_load_kv, before the
-            # forward pass: the request admits and schedules like a plain
-            # request instead of parking in WAITING_FOR_REMOTE_KVS.
+            # The hit is loaded in this step's handle_preemptions, before the
+            # runner prepares its inputs: the request admits and schedules
+            # like a plain request instead of parking in WAITING_FOR_REMOTE_KVS.
             return num_hit_tokens, False
         return num_hit_tokens, bool(num_hit_tokens)
 
