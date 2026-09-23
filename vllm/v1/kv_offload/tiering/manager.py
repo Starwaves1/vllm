@@ -25,6 +25,7 @@ high watermark, the coldest blocks such a tier lacks are written to it (see
 _writeback_step), so a block evicted later is still on the secondary tier.
 """
 
+import itertools
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -84,8 +85,8 @@ class _WritebackState:
     """Write-back bookkeeping for one secondary tier (scheduler thread)."""
 
     tier: SecondaryTierManager
-    # Primary-tier occupancy (blocks) at which flushing starts, and the number
-    # of unwritten blocks it flushes down to.
+    # Primary-tier occupancy (blocks) at which flushing starts; the coldest
+    # (num_blocks - low_blocks) evictable blocks are kept written.
     high_blocks: int
     low_blocks: int
     # Blocks in the primary tier that this tier does not hold yet. Includes
@@ -890,34 +891,35 @@ class TieringOffloadingManager(OffloadingManager):
 
     def _writeback_step(self, wb: _WritebackState) -> None:
         """Once per scheduler step. While the primary tier holds at least
-        ``high_blocks`` blocks, write the coldest unwritten blocks (in the
-        primary's eviction order) to ``wb.tier`` until at most ``low_blocks``
-        are left unwritten, or the tier declines (store backlog cap, breaker).
-        Eviction itself never waits: a block evicted before its write
-        started is lost to the tier (counted in writeback_lost_blocks)."""
+        ``high_blocks`` blocks, keep its cold end on ``wb.tier``: write the
+        unwritten blocks among the coldest ``num_blocks - low_blocks``
+        evictable blocks (the next eviction victims), until the tier declines
+        (store backlog cap, breaker). Blocks elsewhere, e.g. just promoted
+        from the tier, don't count: only the cold end is about to be evicted.
+        Eviction itself never waits: a block evicted before its write started
+        is lost to the tier (counted in writeback_lost_blocks)."""
         primary = self.primary_tier
         if primary.num_used_blocks() < wb.high_blocks:
             return
-        need = len(wb.dirty) - len(wb.flushing) - wb.low_blocks
-        if need <= 0:
-            return
+        window = primary.num_blocks - wb.low_blocks
+        # Write-back never pins more than the cold window.
+        budget = window - len(wb.flushing)
         # Plan first: pinning below changes the evictable set being iterated.
-        # A unit is taken oldest chunk first and cut off once ``need`` blocks
-        # are planned (overshooting by at most one chunk's group siblings);
-        # the rest of a long prefix follows on later steps, so one step never
-        # pins much more than it has to.
+        # A unit is taken oldest chunk first and cut off at the budget
+        # (overshooting by at most one chunk's group siblings); the rest of a
+        # long prefix follows on later steps.
         chunks: list[list[OffloadKey]] = []
         taken: set[OffloadKey] = set()
-        for key in primary.iter_evictable():
+        for key in itertools.islice(primary.iter_evictable(), window):
+            if budget <= 0:
+                break
             if key not in wb.dirty or key in taken or key in wb.flushing:
                 continue
             for chunk in self._plan_writeback_unit(wb, key, taken):
-                if need <= 0:
+                if budget <= 0:
                     break
                 chunks.append(chunk)
-                need -= len(chunk)
-            if need <= 0:
-                break
+                budget -= len(chunk)
         # Submit oldest prefix chunks first, in jobs of about
         # _WRITEBACK_JOB_BLOCKS; a chunk's group siblings share a job.
         batch: list[OffloadKey] = []
