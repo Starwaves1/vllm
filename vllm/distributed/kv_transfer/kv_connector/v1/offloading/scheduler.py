@@ -184,6 +184,10 @@ class SchedulerOffloadConfig(NamedTuple):
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
+    # Load hits synchronously (see OffloadingSpec.sync_load): the request
+    # admits like a plain request and the worker lands the load before the
+    # step's forward.
+    sync_load: bool = False
 
     @classmethod
     def from_spec(
@@ -294,6 +298,22 @@ class SchedulerOffloadConfig(NamedTuple):
             )
         kv_group_configs = tuple(kv_group_configs_list)
         group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
+        if spec.sync_load and len(group_block_sizes) != 1:
+            # Sync loads locate each group's load boundary positionally from
+            # token counts (update_state_after_alloc), which is only exact
+            # when every group's block list uses the same tokens_per_block.
+            raise ValueError(
+                "sync_load requires all KV cache groups to share one block "
+                f"size; got block sizes {sorted(group_block_sizes)}"
+            )
+        if spec.sync_load and vllm_config.use_v2_model_runner:
+            # The V2 runner zeroes new blocks and reads the Mamba state out of
+            # a sync load's destination before handle_preemptions lands the
+            # load, so hybrid models would decode from a stale state.
+            raise ValueError(
+                "sync_load requires the V1 model runner: set "
+                "VLLM_USE_V2_MODEL_RUNNER=0"
+            )
         has_partial_recurrent_group = any(
             config.requires_cow_source
             and config.tokens_per_block > spec.tokens_per_hash
@@ -342,6 +362,7 @@ class SchedulerOffloadConfig(NamedTuple):
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
+            sync_load=spec.sync_load,
         )
 
 
@@ -769,10 +790,12 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens,
                 num_computed_tokens + req_status.max_load_tokens,
             )
-        if self._sliding_window_groups:
+        if self._sliding_window_groups or self.config.sync_load:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
+            # we still have a hit after reduction. A sync load likewise must
+            # leave at least one token to compute in the scheduling step
+            # (async loads instead recompute it when the request unparks).
             max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
@@ -1091,6 +1114,11 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
+        if self.config.sync_load:
+            # The hit is loaded during this step's start_load_kv, before the
+            # forward pass: the request admits and schedules like a plain
+            # request instead of parking in WAITING_FOR_REMOTE_KVS.
+            return num_hit_tokens, False
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
@@ -1132,13 +1160,19 @@ class OffloadingConnectorScheduler:
             # Scan from the computed boundary, not 0: sparse groups (Mamba,
             # SWA) legitimately hold non-null unhashed blocks below it.
             # Skip nulls (sentinel / out-of-retention padding).
+            # A sync load's blocks are cached (hashed) by allocate_slots before
+            # this call, so the unhashed-block probe cannot find its start;
+            # the first non-null block past the computed boundary is it
+            # (sync_load requires one block size, so positions line up).
             first_fresh_gpu_block_idx = cdiv(
                 num_locally_computed_tokens, tokens_per_block
             )
             load_start_gpu_block_idx = num_gpu_blocks
             for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
                 block = group_blocks[i]
-                if not block.is_null and block.block_hash is None:
+                if not block.is_null and (
+                    self.config.sync_load or block.block_hash is None
+                ):
                     load_start_gpu_block_idx = i
                     break
 
@@ -1731,8 +1765,18 @@ class OffloadingConnectorScheduler:
             dst_spec = store_output.store_spec
 
             job_id = self._generate_job_id()
-            # a store can only be issued when no load is pending.
-            if req_status.transfer_jobs:
+            # a store can only be issued when no ASYNC load is pending: an
+            # async-loading request is parked out of num_scheduled_tokens, so
+            # a pending load job here would mean corrupted accounting. A SYNC
+            # load job is expected instead: the request schedules (and can
+            # produce newly-storable chunks, e.g. the computed tail past a
+            # partial hit) in the very step that issued its load job, and the
+            # job lingers in transfer_jobs until the worker's completion ack
+            # lands. This is safe: the load is host-blocking and completes
+            # before its step's forward pass, while store submission is
+            # deferred to the next engine step, so a store can never copy
+            # blocks its request's load has not yet filled.
+            if req_status.transfer_jobs and not self.config.sync_load:
                 any_jid = next(iter(req_status.transfer_jobs))
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
@@ -1788,6 +1832,18 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None or not req_status.transfer_jobs:
+                continue
+            if self.config.sync_load:
+                # A sync load job may linger in transfer_jobs until its
+                # completion ack even though the transfer itself finished
+                # before its step's forward pass (host-blocking wait), so it
+                # needs no flush; only pending stores must be flushed before
+                # the preempted request's blocks are reused.
+                self._current_batch_jobs_to_flush.update(
+                    jid
+                    for jid in req_status.transfer_jobs
+                    if self._jobs[jid].is_store
+                )
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store
