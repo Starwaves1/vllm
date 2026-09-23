@@ -21,11 +21,33 @@ Bounded mode (``max_bytes`` set):
     lookups, loads and touches refresh recency. Lookups are answered from the
     index synchronously, so a disk hit starts its promotion in the same step.
     The directory ``<base_path>_r<rank>`` must be owned by one engine.
+
+Store backlog cap (``max_inflight_store_bytes`` set):
+    Every store job pins its primary (CPU) blocks until the write finishes, so
+    a disk slower than the offload rate fills the CPU tier with pinned blocks.
+    Once the bytes of unfinished store jobs reach the cap, the tier declines
+    new store batches (``accepts_store``), for the rest of that request.
+
+Circuit breaker (``breaker_consecutive_failures``, 0 disables):
+    After N consecutive failed jobs the tier is disabled: lookups miss, new
+    loads/stores are not started, in-flight jobs complete normally. Every
+    ``breaker_probe_interval_s`` a daemon thread writes, fsyncs, reads back
+    and deletes a small file; a success within ``breaker_probe_timeout_s``
+    re-enables the tier. A hung disk trips it too: a job running for
+    ``breaker_stall_s`` while no job finished in that time. ENOSPC on a store
+    does not count; it lowers the effective ``max_bytes`` to 95% of the
+    current cache instead (never below half the configured value). Every job
+    and the probe first check that the tier directory is still on the device
+    it was on at startup, so an unmounted drive is never replaced by
+    directories on the parent filesystem.
 """
 
+import contextlib
+import errno
 import functools
 import json
 import os
+import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Collection, Iterable
@@ -93,16 +115,27 @@ class FsTierMetrics:
     STORE_TIME = "vllm:kv_offload_fs_store_time"
     EVICTED_BYTES = "vllm:kv_offload_fs_evicted_bytes"
     STORES_SKIPPED = "vllm:kv_offload_fs_stores_skipped"
+    STORES_DROPPED = "vllm:kv_offload_fs_stores_dropped"
+    DISABLED = "vllm:kv_offload_fs_disabled"
+    BREAKER_TRIPS = "vllm:kv_offload_fs_breaker_trips"
 
 
-def _parse_max_bytes(max_bytes: Any) -> int | None:
+_PROBE_BYTES = 4 << 20
+# Extra files one store admission may evict beyond its own size, to pay off
+# an ENOSPC shrink a few files at a time instead of in one scheduler step.
+_EVICT_EXTRA_BLOCKS = 8
+# An ENOSPC shrink never takes max_bytes below this fraction of the config.
+_MIN_MAX_BYTES_FRACTION = 0.5
+
+
+def _parse_max_bytes(max_bytes: Any, name: str = "max_bytes") -> int | None:
     if max_bytes is None:
         return None
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int | float | str):
-        raise TypeError(f"max_bytes must be a non-negative integer, got {max_bytes!r}")
+        raise TypeError(f"{name} must be a non-negative integer, got {max_bytes!r}")
     value = int(float(max_bytes))
     if value < 0:
-        raise ValueError(f"max_bytes must be a non-negative integer, got {max_bytes!r}")
+        raise ValueError(f"{name} must be a non-negative integer, got {max_bytes!r}")
     return value
 
 
@@ -187,6 +220,18 @@ class FileSystemTierManager(SecondaryTierManager):
                     "could be freed (every file pinned by an in-flight load)."
                 )
             ),
+            m.STORES_DROPPED: OffloadingCounterMetadata(
+                documentation=(
+                    "Blocks not sent to the fs tier because its store backlog "
+                    "was full or the tier was disabled."
+                )
+            ),
+            m.DISABLED: OffloadingGaugeMetadata(
+                documentation="1 while the fs tier is disabled by its breaker."
+            ),
+            m.BREAKER_TRIPS: OffloadingCounterMetadata(
+                documentation="Times the fs tier was disabled after failed jobs."
+            ),
         }
 
     def __init__(
@@ -200,6 +245,11 @@ class FileSystemTierManager(SecondaryTierManager):
         enable_kv_events: bool = False,
         locality: str | None = None,
         max_bytes: int | None = None,
+        max_inflight_store_bytes: int | None = None,
+        breaker_consecutive_failures: int = 8,
+        breaker_probe_interval_s: float = 300.0,
+        breaker_probe_timeout_s: float = 30.0,
+        breaker_stall_s: float = 120.0,
     ):
         """
         Args:
@@ -217,10 +267,31 @@ class FileSystemTierManager(SecondaryTierManager):
                 to the publishing vLLM instance.
             max_bytes: Cap on block-file bytes (LRU eviction). None keeps the
                 historical unbounded, write-through-forever behavior.
+            max_inflight_store_bytes: Cap on bytes of unfinished store jobs;
+                over it, new store batches are declined. None: no cap.
+            breaker_consecutive_failures: Failed jobs in a row that disable
+                the tier. 0 disables the breaker.
+            breaker_probe_interval_s: Seconds between recovery probes while
+                the tier is disabled.
+            breaker_probe_timeout_s: A probe slower than this counts as failed.
+            breaker_stall_s: Disable the tier when a job has run this long and
+                no job finished in that time (a hung disk). 0: off.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
         self._max_bytes = _parse_max_bytes(max_bytes)
+        self._max_inflight_store_bytes = _parse_max_bytes(
+            max_inflight_store_bytes, "max_inflight_store_bytes"
+        )
+        self._breaker_threshold = int(breaker_consecutive_failures)
+        self._probe_interval = float(breaker_probe_interval_s)
+        self._probe_timeout = float(breaker_probe_timeout_s)
+        self._stall_s = float(breaker_stall_s)
+        self._min_max_bytes = (
+            None
+            if self._max_bytes is None
+            else int(self._max_bytes * _MIN_MAX_BYTES_FRACTION)
+        )
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -243,6 +314,30 @@ class FileSystemTierManager(SecondaryTierManager):
         # Per-job I/O time, written by the pool worker before the job is
         # published as finished and read on the scheduler thread afterwards.
         self._job_io_time: dict[JobId, float] = {}
+        # errno of a failed job's OSError, handed over like _job_io_time.
+        self._job_errno: dict[JobId, int | None] = {}
+        # Primary bytes pinned by submitted, unfinished store jobs
+        # (max_inflight_store_bytes), per job and in total.
+        self._store_job_pinned: dict[JobId, int] = {}
+        self._inflight_store_bytes = 0
+        # Store jobs with nothing left to write: reported done at the next
+        # poll instead of queueing behind the write backlog.
+        self._done_jobs: list[JobId] = []
+        # Requests whose later store batches skip this tier (after a drop, a
+        # later chunk sits behind a hole and is unreachable by prefix lookup).
+        self._dropping_reqs: set[str] = set()
+        # Circuit breaker. _probe_thread/_probe_result are written by the
+        # probe thread; the scheduler thread only reads them.
+        self._consecutive_failures = 0
+        self._tripped = False
+        self._rejected_jobs: list[JobId] = []  # submitted while tripped
+        self._next_probe_time = 0.0
+        self._probe_thread: threading.Thread | None = None
+        self._probe_result: tuple[bool, str] = (False, "")
+        # Stall detection: per queued job a one-element list the worker sets
+        # to time.monotonic() when it starts the job (0.0 = still queued).
+        self._job_started: dict[JobId, list[float]] = {}
+        self._last_progress = time.monotonic()
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -287,6 +382,16 @@ class FileSystemTierManager(SecondaryTierManager):
         self._n_store_time = 0.0
         self._n_evicted_bytes = 0
         self._n_stores_skipped = 0
+        self._n_stores_dropped = 0
+        self._n_breaker_trips = 0
+
+        # Record the device of the tier directory: jobs and the probe fail
+        # instead of creating a new tree on the parent filesystem if the
+        # drive is unmounted (e.g. a nofail mount).
+        self._storage_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
+        os.makedirs(self._storage_dir, exist_ok=True)
+        self._storage_dev = os.stat(self._storage_dir).st_dev
+        self._probe_path = os.path.join(self._storage_dir, ".breaker_probe.tmp")
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
@@ -298,7 +403,6 @@ class FileSystemTierManager(SecondaryTierManager):
         self._writing: set[OffloadKey] = set()  # in-flight stores
         self._store_job_writes: dict[JobId, list[OffloadKey]] = {}
         if self._max_bytes is not None:
-            self._storage_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
             self._scan_existing()
             excess = self._cache_bytes - self._max_bytes
             if excess > 0:
@@ -413,17 +517,20 @@ class FileSystemTierManager(SecondaryTierManager):
             new_keys.append(key)
             new_bids.append(int(bid))
         bs = self._block_size
-        excess = self._cache_bytes + self._reserved_bytes + len(new_keys) * bs
-        excess -= self._max_bytes
-        if excess > 0:
-            self._evict(excess)
-            excess = self._cache_bytes + self._reserved_bytes + len(new_keys) * bs
-            excess -= self._max_bytes
-            if excess > 0:
-                n_keep = max(0, len(new_keys) - (excess + bs - 1) // bs)
-                self._n_stores_skipped += len(new_keys) - n_keep
-                del new_keys[n_keep:]
-                del new_bids[n_keep:]
+        n = len(new_keys)
+        room = self._max_bytes - self._cache_bytes - self._reserved_bytes
+        freed = 0
+        if n * bs > room:
+            # Evict at most this job's size plus a few files: after an ENOSPC
+            # shrink (room < 0) later stores pay the rest off gradually.
+            freed = self._evict(min(n * bs - room, (n + _EVICT_EXTRA_BLOCKS) * bs))
+            room += freed
+        # Over the cap after a shrink, a store may still use what it freed.
+        n_keep = min(n, max(room, freed) // bs)
+        if n_keep < n:
+            self._n_stores_skipped += n - n_keep
+            del new_keys[n_keep:]
+            del new_bids[n_keep:]
         self._reserved_bytes += len(new_keys) * bs
         self._writing.update(new_keys)
         self._store_job_writes[job_id] = new_keys
@@ -438,7 +545,10 @@ class FileSystemTierManager(SecondaryTierManager):
         self._writing.difference_update(written)
         for key in written:
             # A failed batch stops at the first bad block; earlier ones landed.
-            if not success and not os.path.exists(self.file_mapper.get_file_name(key)):
+            # While tripped, don't stat a sick disk: drop them from the index.
+            if not success and (
+                self._tripped or not os.path.exists(self.file_mapper.get_file_name(key))
+            ):
                 continue
             if key not in self._entries:
                 self._cache_bytes += bs
@@ -446,13 +556,168 @@ class FileSystemTierManager(SecondaryTierManager):
             self._entries.move_to_end(key)
 
     # ------------------------------------------------------------------
+    # Circuit breaker (scheduler thread, except _run_probe)
+    # ------------------------------------------------------------------
+
+    def _on_job_result(self, success: bool, err: int | None, is_store: bool):
+        if (
+            not success
+            and is_store
+            and err == errno.ENOSPC
+            and self._max_bytes is not None
+            and self._shrink_max_bytes()
+        ):
+            return  # eviction frees space; not the disk's fault
+        if self._tripped or self._breaker_threshold <= 0:
+            return
+        if success:
+            self._consecutive_failures = 0
+            return
+        if not is_store and err == errno.ENOENT:
+            return  # file gone (stale index entry), not a failing disk
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._breaker_threshold:
+            self._trip(
+                f"{self._consecutive_failures} consecutive failed jobs (last: "
+                f"{os.strerror(err) if err else 'I/O error'})"
+            )
+
+    def _check_stall(self, now: float) -> None:
+        """Trip on a hung disk: a job has run for breaker_stall_s and no job
+        finished in that time. The stuck jobs are left to finish normally."""
+        if self._tripped or self._breaker_threshold <= 0 or self._stall_s <= 0:
+            return
+        if now - self._last_progress <= self._stall_s:
+            return
+        started = [s[0] for s in self._job_started.values() if s[0]]
+        if started and now - min(started) > self._stall_s:
+            self._trip(
+                f"I/O stalled (a job has run for {now - min(started):.0f} s "
+                f"and none finished in {self._stall_s:.0f} s)"
+            )
+
+    def _trip(self, reason: str) -> None:
+        self._tripped = True
+        self._n_breaker_trips += 1
+        self._next_probe_time = time.monotonic() + self._probe_interval
+        logger.warning(
+            "fs KV tier disabled: %s; lookups miss and no new transfers start "
+            "until a probe of '%s' succeeds (every %.0f s)",
+            reason,
+            self._probe_path,
+            self._probe_interval,
+        )
+
+    def _shrink_max_bytes(self) -> bool:
+        """Lower max_bytes after ENOSPC. False once it is at its floor: the
+        disk is full for other reasons, so the failure counts as one."""
+        assert self._max_bytes is not None and self._min_max_bytes is not None
+        new_max = max(int(self._cache_bytes * 0.95), self._min_max_bytes)
+        if new_max >= self._max_bytes:
+            # Already shrunk for this episode, unless at the floor.
+            return self._max_bytes > self._min_max_bytes
+        logger.warning(
+            "fs KV tier: disk full (ENOSPC); lowering max_bytes from %.1f GB "
+            "to %.1f GB (95%% of cached bytes, floor %.1f GB) until restart",
+            self._max_bytes / 1e9,
+            new_max / 1e9,
+            self._min_max_bytes / 1e9,
+        )
+        self._max_bytes = new_max
+        return True
+
+    def _check_storage_dev(self) -> None:
+        """Raise unless the tier directory is still on its startup device
+        (worker and probe threads). Keeps an unmounted drive from being
+        replaced by a new tree on the parent filesystem."""
+        try:
+            dev = os.stat(self._storage_dir).st_dev
+        except FileNotFoundError:
+            dev = None
+        if dev != self._storage_dev:
+            raise OSError(
+                errno.ENODEV,
+                "fs KV tier directory is missing or on another device (unmounted?)",
+                self._storage_dir,
+            )
+
+    def _maybe_probe(self) -> None:
+        """Start or collect a recovery probe. Never blocks: a probe stuck in
+        the kernel just keeps the tier disabled."""
+        thread = self._probe_thread
+        if thread is not None:
+            if thread.is_alive():
+                return
+            self._probe_thread = None
+            ok, detail = self._probe_result
+            if ok:
+                self._tripped = False
+                self._consecutive_failures = 0
+                self._last_progress = time.monotonic()  # stall grace period
+                logger.warning("fs KV tier re-enabled: probe %s", detail)
+                return
+            logger.info("fs KV tier probe failed (%s); still disabled", detail)
+            self._next_probe_time = time.monotonic() + self._probe_interval
+            return
+        if time.monotonic() < self._next_probe_time:
+            return
+        self._probe_result = (False, "did not finish")
+        thread = threading.Thread(
+            target=self._run_probe, name="vllm_kv_py_fs_probe", daemon=True
+        )
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            logger.warning("fs KV tier: cannot start probe thread: %s", exc)
+            self._next_probe_time = time.monotonic() + self._probe_interval
+            return
+        self._probe_thread = thread
+
+    def _run_probe(self) -> None:
+        """Probe thread: write + fsync + read back + delete a small file."""
+        path = self._probe_path
+        data = os.urandom(_PROBE_BYTES)
+        t0 = time.monotonic()
+        try:
+            self._check_storage_dev()  # never creates directories
+            with open(path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            with open(path, "rb") as f:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                back = f.read()
+            os.remove(path)
+            elapsed = time.monotonic() - t0
+            if back != data:
+                result = (False, "read-back mismatch")
+            elif elapsed > self._probe_timeout:
+                result = (False, f"took {elapsed:.1f} s > {self._probe_timeout} s")
+            else:
+                result = (True, f"ok ({_PROBE_BYTES >> 20} MB in {elapsed:.2f} s)")
+        except Exception as exc:
+            result = (False, repr(exc))
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        self._probe_result = result
+
+    # ------------------------------------------------------------------
     # I/O tasks (pool worker threads)
     # ------------------------------------------------------------------
 
-    def _run_io(self, job_id: JobId, fn, paths: list[str], offsets: list[int]):
+    def _run_io(
+        self,
+        job_id: JobId,
+        fn,
+        paths: list[str],
+        offsets: list[int],
+        started: list[float],
+    ):
+        started[0] = time.monotonic()
         t0 = time.perf_counter()
         try:
             if paths:
+                self._check_storage_dev()
                 fn(
                     paths,
                     self._primary_kv_view,
@@ -460,6 +725,9 @@ class FileSystemTierManager(SecondaryTierManager):
                     self._block_size,
                     self._use_o_direct,
                 )
+        except OSError as exc:
+            self._job_errno[job_id] = exc.errno
+            raise
         finally:
             self._job_io_time[job_id] = time.perf_counter() - t0
 
@@ -473,6 +741,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self._tripped:
+            return LookupResult.MISS
         if self._max_bytes is not None:
             # The index is authoritative in bounded mode: answer now instead
             # of a RETRY round trip through the async prober.
@@ -486,21 +756,59 @@ class FileSystemTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     @override
+    def accepts_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> bool:
+        req_id = req_context.req_id
+        if req_id not in self._dropping_reqs:
+            if not self._tripped and self._store_fits(keys):
+                return True
+            self._dropping_reqs.add(req_id)
+        self._n_stores_dropped += len(keys)
+        return False
+
+    def _store_fits(self, keys: Collection[OffloadKey]) -> bool:
+        cap = self._max_inflight_store_bytes
+        if cap is None or self._inflight_store_bytes == 0:
+            return True  # always admit one job, however large
+        if self._max_bytes is not None and all(
+            k in self._entries or k in self._writing for k in keys
+        ):
+            return True  # nothing to write: done at the next poll, not queued
+        # Every key stays pinned until the job finishes, written or not.
+        return self._inflight_store_bytes + len(keys) * self._block_size <= cap
+
+    @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
+        if self._tripped:
+            self._rejected_jobs.append(job_id)
+            return
         keys = list(job_metadata.keys)
         block_ids: Collection[int] = job_metadata.block_ids
         if self._max_bytes is not None:
             keys, block_ids = self._admit_store(job_id, keys, job_metadata.block_ids)
+        if not keys:
+            # Nothing to write: don't queue behind the write backlog; the
+            # primary pins are released at the next poll.
+            if self._max_bytes is not None:
+                self._finish_store(job_id, True)
+            self._done_jobs.append(job_id)
+            return
         if self.events is not None:
             self._store_job_keys[job_id] = keys
         self._store_job_bytes[job_id] = len(keys) * self._block_size
+        pinned = len(job_metadata.keys) * self._block_size
+        self._store_job_pinned[job_id] = pinned
+        self._inflight_store_bytes += pinned
+        started = self._job_started[job_id] = [0.0]
         task = functools.partial(
             self._run_io,
             job_id,
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
             [int(bid) * self._block_size for bid in block_ids],
+            started,
         )
         self._pool.enqueue_store(job_id, 1, [task])
 
@@ -508,18 +816,26 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_load(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
         keys = list(job_metadata.keys)
+        if self._tripped:
+            # Nothing touches the primary slots: failing the job is safe.
+            self._rejected_jobs.append(job_id)
+            self._n_load_failures += 1
+            self._lookup_manager.mark_miss(keys)
+            return
         self._load_job_keys[job_id] = keys
         if self._max_bytes is not None:
             for key in keys:
                 self._pinned[key] += 1
                 if key in self._entries:
                     self._entries.move_to_end(key)
+        started = self._job_started[job_id] = [0.0]
         task = functools.partial(
             self._run_io,
             job_id,
             batch_load_block,
             [self.file_mapper.get_file_name(key) for key in keys],
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
+            started,
         )
         self._pool.enqueue_load(job_id, 1, [task])
 
@@ -528,11 +844,19 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         Collect completed jobs from the finished-jobs queue.
         """
-        results = []
+        results = [JobResult(job_id=j, success=False) for j in self._rejected_jobs]
+        results += [JobResult(job_id=j, success=True) for j in self._done_jobs]
+        self._rejected_jobs.clear()
+        self._done_jobs.clear()
+        now = time.monotonic()
         for job_id, success in self._pool.get_finished():
+            self._last_progress = now
+            self._job_started.pop(job_id, None)
             io_time = self._job_io_time.pop(job_id, 0.0)
+            err = self._job_errno.pop(job_id, None)
             load_keys = self._load_job_keys.pop(job_id, None)
             if load_keys is not None:
+                self._on_job_result(success, err, is_store=False)
                 if self._max_bytes is not None:
                     for key in load_keys:
                         self._pinned[key] -= 1
@@ -547,16 +871,19 @@ class FileSystemTierManager(SecondaryTierManager):
                     # of re-promoting an unreadable block forever.
                     self._n_load_failures += 1
                     self._lookup_manager.mark_miss(load_keys)
-                    if self._max_bytes is not None:
+                    if self._max_bytes is not None and not self._tripped:
                         for key in load_keys:
                             path = self.file_mapper.get_file_name(key)
                             if key in self._entries and not os.path.exists(path):
                                 self._cache_bytes -= self._entries.pop(key)
             else:
-                self._n_store_bytes += self._store_job_bytes.pop(job_id, 0)
+                nbytes = self._store_job_bytes.pop(job_id, 0)
+                self._inflight_store_bytes -= self._store_job_pinned.pop(job_id, 0)
+                self._n_store_bytes += nbytes
                 self._n_store_time += io_time
                 if self._max_bytes is not None:
                     self._finish_store(job_id, success)
+                self._on_job_result(success, err, is_store=True)
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
@@ -569,6 +896,7 @@ class FileSystemTierManager(SecondaryTierManager):
                         )
                     )
             results.append(JobResult(job_id=job_id, success=success))
+        self._check_stall(now)
         return results
 
     @override
@@ -587,6 +915,8 @@ class FileSystemTierManager(SecondaryTierManager):
         if self._max_bytes is not None:
             stats.set_gauge(m.CACHE_BYTES, self._cache_bytes)
             stats.set_gauge(m.CACHE_BLOCKS, len(self._entries))
+        if self._breaker_threshold > 0:
+            stats.set_gauge(m.DISABLED, int(self._tripped))
         for name, attr in (
             (m.LOAD_BYTES, "_n_load_bytes"),
             (m.LOAD_TIME, "_n_load_time"),
@@ -595,6 +925,8 @@ class FileSystemTierManager(SecondaryTierManager):
             (m.STORE_TIME, "_n_store_time"),
             (m.EVICTED_BYTES, "_n_evicted_bytes"),
             (m.STORES_SKIPPED, "_n_stores_skipped"),
+            (m.STORES_DROPPED, "_n_stores_dropped"),
+            (m.BREAKER_TRIPS, "_n_breaker_trips"),
         ):
             value = getattr(self, attr)
             if value:
@@ -615,10 +947,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        self._dropping_reqs.discard(req_context.req_id)
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         self._lookup_manager.flush()
+        if self._tripped:
+            self._maybe_probe()
 
     @override
     def shutdown(self) -> None:

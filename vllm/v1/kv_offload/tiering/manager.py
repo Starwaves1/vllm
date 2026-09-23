@@ -587,8 +587,7 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier in request_level_tiers:
-            job_metadata = self.create_store_job(ready_keys, req_context)
-            tier.submit_store(job_metadata)
+            self._submit_store_to_tier(tier, ready_keys, req_context)
 
     @override
     def complete_store(
@@ -625,8 +624,7 @@ class TieringOffloadingManager(OffloadingManager):
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
             for tier in self.secondary_tiers:
-                job_metadata = self.create_store_job(keys, req_context)
-                tier.submit_store(job_metadata)
+                self._submit_store_to_tier(tier, keys, req_context)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -635,6 +633,21 @@ class TieringOffloadingManager(OffloadingManager):
         assert state.pending_primary_stores > 0
         state.pending_primary_stores -= 1
         self._maybe_finalize_request(req_id)
+
+    def _submit_store_to_tier(
+        self,
+        tier: SecondaryTierManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> bool:
+        """Pin ``keys`` in the primary tier and submit a store job to ``tier``,
+        unless the tier declines the batch (accepts_store(), e.g. its write
+        backlog is full or it is disabled). Returns whether a job was
+        submitted; a declined batch is not pinned."""
+        if not tier.accepts_store(keys, req_context):
+            return False
+        tier.submit_store(self.create_store_job(keys, req_context))
+        return True
 
     def create_store_job(
         self,
