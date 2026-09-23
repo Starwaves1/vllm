@@ -19,6 +19,12 @@ Configuration via kv_connector_extra_config:
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
+      - store_policy: (optional) "write_through" (default): every block
+        stored in the CPU tier is copied to this tier. "write_back": blocks are
+        copied only while the CPU tier is filled to writeback_high_watermark
+        (default 0.85, fraction of its blocks), coldest first, until at most
+        writeback_low_watermark (default 0.75) of its blocks are not on this
+        tier. Blocks evicted from the CPU tier before that are not copied.
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
@@ -44,6 +50,8 @@ from typing_extensions import override
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
+    OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
     OffloadingManager,
     OffloadingMetricMetadata,
@@ -125,6 +133,24 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     5,
                     10,
                 ),
+            )
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_FLUSHED] = OffloadingCounterMetadata(
+            documentation=(
+                "Blocks written to a write-back secondary tier because the CPU "
+                "tier was filling up."
+            )
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_LOST] = OffloadingCounterMetadata(
+            documentation=(
+                "Blocks evicted from the CPU tier before a write-back secondary "
+                "tier had a copy (recomputed if needed again)."
+            )
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_DIRTY] = OffloadingGaugeMetadata(
+            documentation=(
+                "Blocks in the CPU tier that a write-back secondary tier does "
+                "not hold yet."
             )
         )
         secondary_tier_configs = extra_config.get("secondary_tiers", [])

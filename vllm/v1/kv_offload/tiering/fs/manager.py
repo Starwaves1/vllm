@@ -28,6 +28,12 @@ Store backlog cap (``max_inflight_store_bytes`` set):
     Once the bytes of unfinished store jobs reach the cap, the tier declines
     new store batches (``accepts_store``), for the rest of that request.
 
+Write-back (``store_policy: "write_back"``, handled by TieringOffloadingManager):
+    Blocks are written only when the CPU tier fills up. ``is_stored`` answers
+    from the bounded-mode index; write-back jobs (req_id WRITEBACK_REQ_ID) are
+    subject to the store backlog cap and the breaker, but a decline is not
+    sticky and not counted as dropped (the blocks are offered again).
+
 Circuit breaker (``breaker_consecutive_failures``, 0 disables):
     After N consecutive failed jobs the tier is disabled: lookups miss, new
     loads/stores are not started, in-flight jobs complete normally. Every
@@ -83,6 +89,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
+    WRITEBACK_REQ_ID,
     JobId,
     JobMetadata,
     JobResult,
@@ -760,12 +767,22 @@ class FileSystemTierManager(SecondaryTierManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> bool:
         req_id = req_context.req_id
+        if req_id == WRITEBACK_REQ_ID:
+            # Not sticky and not a drop: the blocks stay in the CPU tier and
+            # the write-back flusher offers them again on a later step.
+            return not self._tripped and self._store_fits(keys)
         if req_id not in self._dropping_reqs:
             if not self._tripped and self._store_fits(keys):
                 return True
             self._dropping_reqs.add(req_id)
         self._n_stores_dropped += len(keys)
         return False
+
+    @override
+    def is_stored(self, key: OffloadKey) -> bool | None:
+        if self._max_bytes is None:
+            return None  # unbounded: only a stat() could tell
+        return key in self._entries
 
     def _store_fits(self, keys: Collection[OffloadKey]) -> bool:
         cap = self._max_inflight_store_bytes

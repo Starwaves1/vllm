@@ -39,6 +39,27 @@ class TieringOffloadingMetrics:
 
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_tiering_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_tiering_lookup_async_delay_seconds"
+    WRITEBACK_FLUSHED = "vllm:kv_offload_tiering_writeback_flushed_blocks"
+    WRITEBACK_LOST = "vllm:kv_offload_tiering_writeback_lost_blocks"
+    WRITEBACK_DIRTY = "vllm:kv_offload_tiering_writeback_dirty_blocks"
+
+
+class StorePolicy:
+    """How blocks newly stored in the primary (CPU) tier reach a secondary
+    tier. Set per tier with the ``store_policy`` key of its config entry."""
+
+    # Every block stored in the primary tier is cascaded right away.
+    WRITE_THROUGH = "write_through"
+    # Blocks are written only when the primary tier is filling up: once its
+    # occupancy reaches ``writeback_high_watermark`` (fraction of its
+    # capacity), the coldest blocks this tier lacks are written until at most
+    # ``writeback_low_watermark`` of the capacity is unwritten ("dirty").
+    WRITE_BACK = "write_back"
+
+
+# req_id of the ReqContext used for write-back store jobs. They belong to no
+# request, so per-request state (e.g. accepts_store stickiness) must skip them.
+WRITEBACK_REQ_ID = "__kv_offload_writeback__"
 
 
 @dataclass
@@ -130,6 +151,42 @@ class SecondaryTierManager(ABC):
         self._primary_kv_view: memoryview = primary_kv_view
         self.tier_type = tier_type
         self.locality: Locality | None = None
+        self.store_policy: str = StorePolicy.WRITE_THROUGH
+        self.writeback_high_watermark = 0.85
+        self.writeback_low_watermark = 0.75
+
+    def configure_store_policy(
+        self,
+        store_policy: str = StorePolicy.WRITE_THROUGH,
+        writeback_high_watermark: float | None = None,
+        writeback_low_watermark: float | None = None,
+    ) -> None:
+        """Set how the manager feeds this tier (see StorePolicy). Called by
+        SecondaryTierFactory with the tier entry's ``store_policy``,
+        ``writeback_high_watermark`` and ``writeback_low_watermark`` keys."""
+        if store_policy not in (StorePolicy.WRITE_THROUGH, StorePolicy.WRITE_BACK):
+            raise ValueError(
+                f"store_policy must be {StorePolicy.WRITE_THROUGH!r} or "
+                f"{StorePolicy.WRITE_BACK!r}, got {store_policy!r}"
+            )
+        high = (
+            self.writeback_high_watermark
+            if writeback_high_watermark is None
+            else float(writeback_high_watermark)
+        )
+        low = (
+            self.writeback_low_watermark
+            if writeback_low_watermark is None
+            else float(writeback_low_watermark)
+        )
+        if not 0.0 <= low < high <= 1.0:
+            raise ValueError(
+                "write-back watermarks need 0 <= writeback_low_watermark < "
+                f"writeback_high_watermark <= 1, got low={low}, high={high}"
+            )
+        self.store_policy = store_policy
+        self.writeback_high_watermark = high
+        self.writeback_low_watermark = low
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -182,9 +239,23 @@ class SecondaryTierManager(ABC):
         Whether to cascade ``keys`` to this tier now.
 
         Called before the primary blocks are pinned for a store job. Returning
-        False skips this tier for the batch: no pin, no job.
+        False skips this tier for the batch: no pin, no job. Write-back store
+        jobs use a ReqContext with req_id WRITEBACK_REQ_ID; a declined
+        write-back batch is retried on a later step.
         """
         return True
+
+    def is_stored(self, key: OffloadKey) -> bool | None:
+        """
+        Whether this tier holds ``key``, answered from local state without
+        I/O, or None if the tier cannot tell cheaply.
+
+        Used in write-back mode: a block the tier already holds is not
+        written again, and a block counts as written ("clean") once a store
+        job reports it here (or, when this returns None, once its job
+        succeeded).
+        """
+        return None
 
     @abstractmethod
     def submit_load(self, job_metadata: JobMetadata) -> None:
