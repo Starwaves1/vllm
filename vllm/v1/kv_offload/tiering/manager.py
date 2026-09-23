@@ -338,7 +338,14 @@ class TieringOffloadingManager(OffloadingManager):
                     and req_state.secondary_lookup_start_time is None
                 ):
                     req_state.secondary_lookup_start_time = lookup_start
-                return LookupResult.MISS if not promoted else LookupResult.RETRY
+                # HIT_PENDING, not RETRY (backport of upstream #51840): the block
+                # is known to exist and is on its way to the primary tier. RETRY
+                # made the connector's sliding-window (Mamba/GDN, SWA) lookup
+                # keep scanning backward and promote every earlier chunk of the
+                # group from the secondary tier, although only the chunk at the
+                # hit boundary is ever loaded (4x disk reads for a 3-GDN-group
+                # hybrid model, and CPU-tier slots wasted on unread state).
+                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
 
