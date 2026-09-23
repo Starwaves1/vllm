@@ -219,6 +219,16 @@ class SecondaryTierManager(ABC):
         """
         pass
 
+    def accepts_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> bool:
+        """Whether to cascade ``keys`` to this tier now.
+
+        Called before the primary blocks are pinned for a store job. Returning
+        False skips this tier for the batch: no pin, no job.
+        """
+        return True
+
     @abstractmethod
     def submit_load(self, job_metadata: TransferJob) -> None:
         """Submit an async job to load chunks from this secondary tier to the

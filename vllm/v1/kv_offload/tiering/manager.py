@@ -693,11 +693,7 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier_idx in request_level_tiers:
-            tier = self.secondary_tiers[tier_idx]
-            if not self._should_store_to_tier(tier, len(ready_keys)):
-                continue
-            job_metadata = self.create_store_job(ready_keys, req_context, tier_idx)
-            tier.submit_store(job_metadata)
+            self._submit_store_to_tier(tier_idx, ready_keys, req_context)
 
     def _flush_pending_cascades(self) -> None:
         """Retry request-level cascades parked on an in-flight primary write.
@@ -749,11 +745,8 @@ class TieringOffloadingManager(OffloadingManager):
             # LoadStoreSpec AND to increment ref_cnt (protecting chunks from
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
-            for tier_idx, tier in enumerate(self.secondary_tiers):
-                if not self._should_store_to_tier(tier, len(keys)):
-                    continue
-                job_metadata = self.create_store_job(keys, req_context, tier_idx)
-                tier.submit_store(job_metadata)
+            for tier_idx in range(len(self.secondary_tiers)):
+                self._submit_store_to_tier(tier_idx, keys, req_context)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -762,6 +755,27 @@ class TieringOffloadingManager(OffloadingManager):
         assert state.pending_primary_stores > 0
         state.pending_primary_stores -= 1
         self._maybe_finalize_request(req_id)
+
+    def _submit_store_to_tier(
+        self,
+        tier_idx: int,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> bool:
+        """Pin ``keys`` in the primary tier and submit a store job to a tier.
+
+        Skipped when the tier's back-pressure policy drops the batch or the
+        tier declines it (accepts_store(), e.g. its write backlog is full or
+        it is disabled). Returns whether a job was submitted; a skipped batch
+        is not pinned.
+        """
+        tier = self.secondary_tiers[tier_idx]
+        if not self._should_store_to_tier(tier, len(keys)):
+            return False
+        if not tier.accepts_store(keys, req_context):
+            return False
+        tier.submit_store(self.create_store_job(keys, req_context, tier_idx))
+        return True
 
     def create_store_job(
         self,
