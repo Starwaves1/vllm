@@ -2367,17 +2367,28 @@ class Scheduler(SchedulerInterface):
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
 
-        Fences are appended in near-monotonic order (a CoW retention fence
-        can lead request-free fences by one step), so stop at the first
-        pending one; any satisfied entry behind it is merely freed later.
+        Scan the whole queue rather than stopping at the first pending
+        fence: a CoW retention fence can lead request-free fences by one
+        step, and when the productive step it awaits never occurs (the
+        copies were attached to a schedule that ended with 0 scheduled
+        tokens, and pool exhaustion then prevents any admission), a
+        stop-at-head scan would pin every satisfiable entry behind it
+        indefinitely; blocks that are exactly what admission needs, so
+        the scheduler deadlocks. Each entry's own fence check is the
+        safety condition; entries whose fence has been processed are safe
+        to free regardless of their position in the queue.
         """
+        if not self.deferred_frees:
+            return
+        pending: deque[tuple[int, list[KVCacheBlock]]] = deque()
         while self.deferred_frees:
-            fence, _ = self.deferred_frees[0]
+            fence, blocks = self.deferred_frees.popleft()
             if fence > self.processed_step_seq:
-                break
-            _, blocks = self.deferred_frees.popleft()
+                pending.append((fence, blocks))
+                continue
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+        self.deferred_frees = pending
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
