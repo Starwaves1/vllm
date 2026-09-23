@@ -387,7 +387,7 @@ def test_unready_blocks_never_flushed(env):
 
 
 def test_prefix_flushed_with_cold_tail_oldest_first(env):
-    e = env(high=0.3, low=0.25)  # 20 blocks, high 6, low 5
+    e = env(high=0.3, low=0.15)  # 20 blocks, high 6, low 3
     chain = [k(c) for c in range(6)]
     e.store(chain)
     # the connector touches a request's keys in chunk order; LRU then holds
@@ -395,17 +395,35 @@ def test_prefix_flushed_with_cold_tail_oldest_first(env):
     e.manager.touch(chain, e.ctx)
     assert list(e.policy.evictable_blocks) == chain[::-1]
     e.step()
-    # 6 unwritten, target 5: one block (c5) is needed, but c5 alone is useless
-    # on disk without c0..c4 (prefix lookup stops at the first miss)
-    assert [list(j.keys) for j in e.jobs()] == [chain]
+    # 3 blocks needed; the cold pick is c5, but c5 on disk is useless without
+    # c0..c4 (prefix lookup stops at the first miss): the prefix goes oldest
+    # first and the step stops at its budget, the rest follows later
+    assert [list(j.keys) for j in e.jobs()] == [chain[:3]]
     e.settle()
-    # only the cold pick goes back to the LRU end; the prefix keeps its
-    # (recent) position, as after a write-through store
-    assert list(e.policy.evictable_blocks) == [k(5)] + chain[:5]
+    # every written block no request used meanwhile goes back to the LRU end,
+    # prefix chunks included
+    assert list(e.policy.evictable_blocks) == chain[:3] + chain[3:][::-1]
+
+
+def test_one_step_pins_no_more_than_needed(env):
+    """A long dirty prefix behind one cold block must not be pinned in one
+    step: the flusher stops at its budget (plus at most one chunk's group
+    siblings), so the CPU tier keeps enough evictable blocks to store."""
+    e = env(n_blocks=200, high=0.75, low=0.6)  # high 150, low 120
+    groups = [[k(c, g) for c in range(40)] for g in range(4)]
+    e.store([key for group in groups for key in group])  # 160 blocks
+    for group in groups:
+        e.manager.touch(group, e.ctx)
+    e.step()  # need = 160 - 120 = 40
+    pinned = [key for j in e.jobs() for key in j.keys]
+    assert 40 <= len(pinned) <= 40 + 3
+    assert sorted(pinned) == sorted(k(c, g) for c in range(10) for g in range(4))
+    # 40 free + 120 evictable: a 80-block store still fits
+    assert e.manager.prepare_store([k(1000 + i) for i in range(80)], e.ctx)
 
 
 def test_prefix_walk_stops_at_block_already_on_disk(env):
-    e = env(high=0.3, low=0.2)  # 20 blocks, high 6, low 4
+    e = env(high=0.3, low=0.1)  # 20 blocks, high 6, low 2
     e.tier.submit_store(make_job(900, [k(2)], [19]))  # c2 on disk already
     drain(e.tier)
     chain = [k(c) for c in range(6)]
@@ -459,7 +477,7 @@ def test_reset_cache_drops_writeback_state(env):
     e.manager.touch([k(i) for i in range(10)], e.ctx)
     e.manager.reset_cache()
     wb = e.wb
-    assert not (wb.dirty or wb.flushing or wb.demote or wb.touched)
+    assert not (wb.dirty or wb.flushing or wb.touched)
     assert not e.manager._writeback_jobs and not e.manager._writeback_parent
     assert e.stats()[_M.WRITEBACK_LOST] == 5  # the 5 never written
 

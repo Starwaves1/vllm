@@ -93,10 +93,8 @@ class _WritebackState:
     dirty: set[OffloadKey] = field(default_factory=set)
     # Blocks pinned by an in-flight write-back job.
     flushing: set[OffloadKey] = field(default_factory=set)
-    # Blocks the flusher picked as cold (not pulled in as a prefix or group
-    # sibling): moved back to the LRU end when their write finishes.
-    demote: set[OffloadKey] = field(default_factory=set)
-    # Flushing blocks read or touched by a request meanwhile: not demoted.
+    # Flushing blocks read or touched by a request meanwhile: not moved back
+    # to the LRU end when their write finishes.
     touched: set[OffloadKey] = field(default_factory=set)
     n_flushed: int = 0
     n_lost: int = 0
@@ -904,42 +902,40 @@ class TieringOffloadingManager(OffloadingManager):
         if need <= 0:
             return
         # Plan first: pinning below changes the evictable set being iterated.
-        # Each planned chunk: (keys of the chunk's groups, picked as cold?).
-        chunks: list[tuple[list[OffloadKey], bool]] = []
+        # A unit is taken oldest chunk first and cut off once ``need`` blocks
+        # are planned (overshooting by at most one chunk's group siblings);
+        # the rest of a long prefix follows on later steps, so one step never
+        # pins much more than it has to.
+        chunks: list[list[OffloadKey]] = []
         taken: set[OffloadKey] = set()
         for key in primary.iter_evictable():
             if key not in wb.dirty or key in taken or key in wb.flushing:
                 continue
-            unit = self._plan_writeback_unit(wb, key, taken)
-            for chunk in unit:
-                chunks.append((chunk, chunk[0] == key))
+            for chunk in self._plan_writeback_unit(wb, key, taken):
+                if need <= 0:
+                    break
+                chunks.append(chunk)
                 need -= len(chunk)
             if need <= 0:
                 break
         # Submit oldest prefix chunks first, in jobs of about
         # _WRITEBACK_JOB_BLOCKS; a chunk's group siblings share a job.
         batch: list[OffloadKey] = []
-        demote: list[OffloadKey] = []
-        for chunk, is_cold in chunks:
+        for chunk in chunks:
             batch.extend(chunk)
-            if is_cold:
-                demote.extend(chunk)
             if len(batch) >= _WRITEBACK_JOB_BLOCKS:
-                if not self._submit_writeback(wb, batch, demote):
+                if not self._submit_writeback(wb, batch):
                     return
-                batch, demote = [], []
+                batch = []
         if batch:
-            self._submit_writeback(wb, batch, demote)
+            self._submit_writeback(wb, batch)
 
-    def _submit_writeback(
-        self, wb: _WritebackState, keys: list[OffloadKey], demote: list[OffloadKey]
-    ) -> bool:
+    def _submit_writeback(self, wb: _WritebackState, keys: list[OffloadKey]) -> bool:
         job = self._submit_store_to_tier(wb.tier, keys, self._writeback_ctx)
         if job is None:
             return False
         self._writeback_jobs[job.job_id] = wb
         wb.flushing.update(keys)
-        wb.demote.update(demote)
         return True
 
     def _finish_writeback_job(
@@ -960,15 +956,16 @@ class TieringOffloadingManager(OffloadingManager):
             if stored and key in wb.dirty:
                 wb.dirty.discard(key)
                 wb.n_flushed += 1
-            used = key in wb.touched
-            wb.touched.discard(key)
-            if key in wb.demote:
-                wb.demote.discard(key)
-                block = primary.get_block(key)
-                if not used and block is not None and block.ref_cnt == 0:
-                    to_demote.append(key)
-        # Unpinning made them most recently used; put the cold blocks back at
-        # the LRU end so the next evictions take written blocks first.
+            if key in wb.touched:
+                wb.touched.discard(key)
+                continue  # used by a request meanwhile: keep it recent
+            block = primary.get_block(key)
+            if block is not None and block.ref_cnt == 0:
+                to_demote.append(key)
+        # Unpinning made them most recently used. Put the blocks no request
+        # used during the write back at the LRU end (prefix chunks included,
+        # or a stale conversation head would jump ahead of recent blocks), so
+        # the next evictions take written blocks first.
         if to_demote:
             primary.demote(to_demote)
 
@@ -1135,7 +1132,6 @@ class TieringOffloadingManager(OffloadingManager):
             wb.n_lost += len(wb.dirty)  # unwritten blocks dropped with the cache
             wb.dirty.clear()
             wb.flushing.clear()
-            wb.demote.clear()
             wb.touched.clear()
         self._writeback_jobs.clear()
         self._writeback_parent.clear()
