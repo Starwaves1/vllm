@@ -23,6 +23,13 @@ Configuration via kv_connector_extra_config:
       - module_path: (optional) Python import path to load 'type' from
         when it names an out-of-tree SecondaryTierManager not registered
         via SecondaryTierFactory.register_tier()
+      - store_policy: (optional) "write_through" (default): every chunk
+        stored in the CPU tier is copied to this tier. "write_back": chunks
+        are copied only while the CPU tier is filled to
+        writeback_high_watermark (default 0.85, fraction of its chunks),
+        coldest first, until at most writeback_low_watermark (default 0.75)
+        of its chunks are not on this tier. Chunks evicted from the CPU tier
+        before that are not copied.
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
 
@@ -238,6 +245,24 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 "Number of active secondary-tier cascade jobs, labeled by tier."
             ),
             labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_FLUSHED] = OffloadingCounterMetadata(
+            documentation=(
+                "Chunks written to a write-back secondary tier because the CPU "
+                "tier was filling up."
+            )
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_LOST] = OffloadingCounterMetadata(
+            documentation=(
+                "Chunks evicted from the CPU tier before a write-back secondary "
+                "tier had a copy (recomputed if needed again)."
+            )
+        )
+        metrics[TieringOffloadingMetrics.WRITEBACK_DIRTY] = OffloadingGaugeMetadata(
+            documentation=(
+                "Chunks in the CPU tier that a write-back secondary tier does "
+                "not hold yet."
+            )
         )
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):

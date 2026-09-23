@@ -145,6 +145,18 @@ class ARCCachePolicy(CachePolicy):
         self.target_t1_size = 0.0
 
     @override
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        # evict() drains T1 first while it is at or over its target size.
+        if len(self.t1) >= int(self.target_t1_size):
+            lists = (self.t1, self.t2)
+        else:
+            lists = (self.t2, self.t1)
+        for chunks in lists:
+            for key, chunk in chunks.items():
+                if chunk.ref_cnt == 0:
+                    yield key
+
+    @override
     def evict(
         self, n: int, protected: set[OffloadKey]
     ) -> list[tuple[OffloadKey, ChunkStatus]] | None:

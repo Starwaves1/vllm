@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
@@ -139,4 +139,21 @@ class CachePolicy(ABC):
 
     def mark_non_evictable(self, key: OffloadKey) -> None:
         """Called when a chunk's ref_cnt transitions from 0."""
+        return
+
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        """Yield the keys of evictable (ref_cnt 0) chunks, roughly in the
+        order evict() would take them (next victim first).
+
+        Optional: needed only by write-back secondary tiers. The caller must
+        not change the policy's state while iterating.
+        """
+        raise NotImplementedError
+
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        """Make evictable ``keys`` the next eviction victims, keeping their
+        relative order (the first key goes first). Keys that are not evictable
+        are ignored. The default is a no-op, for policies whose order already
+        puts them there.
+        """
         return

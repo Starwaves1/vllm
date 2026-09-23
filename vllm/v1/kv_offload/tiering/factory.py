@@ -71,6 +71,16 @@ class SecondaryTierFactory:
         config.pop("module_path", None)
         locality = config.get("locality")
         bp_config = config.pop("backpressure", None)
+        # Handled by the tiering manager for every tier type.
+        store_policy_config = {
+            name: config.pop(name)
+            for name in (
+                "store_policy",
+                "writeback_high_watermark",
+                "writeback_low_watermark",
+            )
+            if name in config
+        }
         bp_detector = None
         if bp_config is not None:
             bp_config = bp_config.copy()
@@ -88,13 +98,19 @@ class SecondaryTierFactory:
                 for k, v in defaults.items():
                     bp_config.setdefault(k, v)
             bp_detector = detector_cls(policy=policy, **bp_config)
-        return tier_cls(
+        tier = tier_cls(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
             tier_type=tier_type,
             backpressure_detector=bp_detector,
             **config,
         )
+        try:
+            tier.configure_store_policy(**store_policy_config)
+        except Exception:
+            tier.shutdown()
+            raise
+        return tier
 
     @classmethod
     def get_tier_class(cls, tier_config: dict) -> type[SecondaryTierManager]:

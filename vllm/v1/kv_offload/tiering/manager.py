@@ -17,10 +17,15 @@ Key Design Principles:
    "data is being promoted, try later"
 5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
    protecting chunks from eviction until complete_read() is called
+
+Write-back tiers (store_policy "write_back") are the exception to 1: chunks are
+not cascaded on store. Once per step, while the primary tier is filled to its
+high watermark, the coldest chunks such a tier lacks are written to it (see
+_writeback_step), so a chunk evicted later is still on the secondary tier.
 """
 
 import time
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -45,12 +50,16 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
+    WRITEBACK_REQ_ID,
     JobId,
     JobResult,
     ParentManager,
     SecondaryTierManager,
+    StorePolicy,
+    TieringOffloadingMetrics,
     TransferJob,
 )
 from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
@@ -65,6 +74,33 @@ class PendingPromotion:
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
     chunk_ids: list[int] = field(default_factory=list)
+
+
+# Max chunks per write-back store job. A job's chunks stay pinned until its
+# last chunk is written, so small jobs release CPU slots sooner.
+_WRITEBACK_JOB_CHUNKS = 16
+
+
+@dataclass
+class _WritebackState:
+    """Write-back bookkeeping for one secondary tier (scheduler thread)."""
+
+    tier: SecondaryTierManager
+    tier_idx: int
+    # Primary-tier occupancy (chunks) at which flushing starts, and the number
+    # of unwritten chunks it flushes down to.
+    high_chunks: int
+    low_chunks: int
+    # Chunks in the primary tier that this tier does not hold yet. Includes
+    # the chunks being written (``flushing``).
+    dirty: set[OffloadKey] = field(default_factory=set)
+    # Chunks pinned by an in-flight write-back job.
+    flushing: set[OffloadKey] = field(default_factory=set)
+    # Flushing chunks read or used by a request meanwhile: not moved back to
+    # the LRU end when their write finishes.
+    touched: set[OffloadKey] = field(default_factory=set)
+    n_flushed: int = 0
+    n_lost: int = 0
 
 
 @dataclass(slots=True)
@@ -123,6 +159,46 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+        # Called with the keys of chunks evicted by prepare_store/prepare_write.
+        self.eviction_listener: Callable[[list[OffloadKey]], None] | None = None
+
+    @override
+    def prepare_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        result = super().prepare_store(keys, req_context)
+        if (
+            result is not None
+            and result.evicted_keys
+            and self.eviction_listener is not None
+        ):
+            self.eviction_listener(result.evicted_keys)
+        return result
+
+    # --- write-back support (read-only views of the cache policy) ---
+
+    @property
+    def num_chunks(self) -> int:
+        return self._num_chunks
+
+    def num_used_chunks(self) -> int:
+        """Slots holding a chunk (ready, being written, or pinned)."""
+        return self._num_allocated_chunks - len(self._free_list)
+
+    def get_chunk(self, key: OffloadKey) -> ChunkStatus | None:
+        return self._policy.get(key)
+
+    def supports_writeback(self) -> bool:
+        return type(self._policy).iter_evictable is not CachePolicy.iter_evictable
+
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        """Evictable chunks, next eviction victim first. Do not change the
+        primary tier while iterating."""
+        return self._policy.iter_evictable()
+
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        """Make evictable ``keys`` the next eviction victims."""
+        self._policy.demote(keys)
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -251,6 +327,39 @@ class TieringOffloadingManager(OffloadingManager):
             tier: i for i, tier in enumerate(self.secondary_tiers)
         }
 
+        # Write-back tiers (store_policy "write_back") by tier index, see
+        # _writeback_step().
+        self._writeback: dict[int, _WritebackState] = {}
+        for tier_idx, tier in enumerate(self.secondary_tiers):
+            if tier.store_policy != StorePolicy.WRITE_BACK:
+                continue
+            if not primary_tier.supports_writeback():
+                raise ValueError(
+                    f"store_policy 'write_back' on secondary tier "
+                    f"'{tier.tier_type}' needs a primary cache policy that "
+                    "implements CachePolicy.iter_evictable() (lru, arc)"
+                )
+            n = primary_tier.num_chunks
+            self._writeback[tier_idx] = _WritebackState(
+                tier=tier,
+                tier_idx=tier_idx,
+                high_chunks=max(1, int(n * tier.writeback_high_watermark)),
+                low_chunks=int(n * tier.writeback_low_watermark),
+            )
+        self._writeback_jobs: dict[JobId, _WritebackState] = {}
+        # Prefix links: key -> key of the preceding chunk of the same KV cache
+        # group, for keys in the primary tier, learned from a request's keys
+        # in prefix order (see _touch_request_keys). A chunk hash chains its
+        # parent's, so a link never changes. Pruned on primary eviction; reset
+        # if it ever outgrows the primary (failed stores).
+        self._writeback_parent: dict[OffloadKey, OffloadKey] = {}
+        # Group-index suffixes of the keys seen (in order), to find a chunk's
+        # siblings.
+        self._writeback_groups: dict[bytes, None] = {}
+        self._writeback_ctx = ReqContext(req_id=WRITEBACK_REQ_ID)
+        if self._writeback:
+            primary_tier.eviction_listener = self._on_primary_evicted
+
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
         return self._jobs
@@ -350,6 +459,11 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
+                    wb = self._writeback_jobs.pop(job_id, None)
+                    if wb is not None:
+                        self._finish_writeback_job(
+                            wb, transfer_job.keys, completed_job.success
+                        )
                     if completed_job.success:
                         self._update_backpressure(tier, job_metadata, completed_job)
 
@@ -568,6 +682,8 @@ class TieringOffloadingManager(OffloadingManager):
             LoadStoreSpec for reading from primary tier.
 
         """
+        if self._writeback:
+            self._note_writeback_use(keys)
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -582,6 +698,8 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
+        if self._writeback:
+            self._note_writeback_use(keys, learn_prefix=True)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -746,7 +864,11 @@ class TieringOffloadingManager(OffloadingManager):
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
             for tier_idx in range(len(self.secondary_tiers)):
-                self._submit_store_to_tier(tier_idx, keys, req_context)
+                wb = self._writeback.get(tier_idx)
+                if wb is None:
+                    self._submit_store_to_tier(tier_idx, keys, req_context)
+                else:
+                    self._mark_dirty(wb, keys)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -761,21 +883,22 @@ class TieringOffloadingManager(OffloadingManager):
         tier_idx: int,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> bool:
+    ) -> TransferJob | None:
         """Pin ``keys`` in the primary tier and submit a store job to a tier.
 
         Skipped when the tier's back-pressure policy drops the batch or the
         tier declines it (accepts_store(), e.g. its write backlog is full or
-        it is disabled). Returns whether a job was submitted; a skipped batch
-        is not pinned.
+        it is disabled). Returns the submitted job, or None if the batch was
+        skipped (and not pinned).
         """
         tier = self.secondary_tiers[tier_idx]
         if not self._should_store_to_tier(tier, len(keys)):
-            return False
+            return None
         if not tier.accepts_store(keys, req_context):
-            return False
-        tier.submit_store(self.create_store_job(keys, req_context, tier_idx))
-        return True
+            return None
+        job_metadata = self.create_store_job(keys, req_context, tier_idx)
+        tier.submit_store(job_metadata)
+        return job_metadata
 
     def create_store_job(
         self,
@@ -804,6 +927,180 @@ class TieringOffloadingManager(OffloadingManager):
         )
         self._register_job(job_metadata, tier_idx)
         return job_metadata
+
+    # ------------------------------------------------------------------
+    # Write-back (store_policy "write_back")
+    # ------------------------------------------------------------------
+
+    def _mark_dirty(self, wb: _WritebackState, keys: Collection[OffloadKey]) -> None:
+        """Chunks just stored in the primary tier: remember the ones ``wb``'s
+        tier lacks instead of cascading them."""
+        get_chunk = self.primary_tier.get_chunk
+        is_stored = wb.tier.is_stored
+        for key in keys:
+            chunk = get_chunk(key)
+            if chunk is None or not chunk.is_ready or is_stored(key):
+                continue
+            wb.dirty.add(key)
+            self._writeback_groups.setdefault(key[-4:])
+
+    def _on_primary_evicted(self, keys: list[OffloadKey]) -> None:
+        for wb in self._writeback.values():
+            dirty = wb.dirty
+            for key in keys:
+                if key in dirty:
+                    dirty.discard(key)
+                    wb.n_lost += 1
+        parent = self._writeback_parent
+        for key in keys:
+            parent.pop(key, None)
+
+    def _note_writeback_use(
+        self, keys: Collection[OffloadKey], learn_prefix: bool = False
+    ) -> None:
+        """Learn prefix links from a request's keys of one KV cache group in
+        chunk order, and note flushing chunks that are in use, so they are not
+        demoted when their write finishes."""
+        flushing = [wb for wb in self._writeback.values() if wb.flushing]
+        if learn_prefix:
+            parent = self._writeback_parent
+            get_chunk = self.primary_tier.get_chunk
+            prev = None
+            for key in keys:
+                if (
+                    prev is not None
+                    and key not in parent
+                    and get_chunk(key) is not None
+                ):
+                    parent[key] = prev
+                prev = key
+            if len(parent) > 2 * self.primary_tier.num_chunks:
+                parent.clear()  # links are re-learned from the next requests
+        for wb in flushing:
+            for key in keys:
+                if key in wb.flushing:
+                    wb.touched.add(key)
+
+    def _flushable(
+        self, wb: _WritebackState, key: OffloadKey, taken: set[OffloadKey]
+    ) -> bool:
+        if key not in wb.dirty or key in wb.flushing or key in taken:
+            return False
+        chunk = self.primary_tier.get_chunk(key)
+        # ref_cnt -1: still being written from the GPU (or promoted); never
+        # read it. Dirty chunks are always ready; this is a safety net.
+        return chunk is not None and chunk.is_ready
+
+    def _plan_writeback_unit(
+        self, wb: _WritebackState, key: OffloadKey, taken: set[OffloadKey]
+    ) -> list[list[OffloadKey]]:
+        """``key`` plus the unwritten earlier chunks of its prefix (oldest
+        first), each with its unwritten siblings of the other KV cache groups.
+
+        A secondary-tier hit needs every chunk before it (prefix lookup stops
+        at the first miss) and, for a hybrid model, the chunks of all groups
+        at the hit boundary. The prefix walk stops at the first chunk that is
+        already written, being written, or not in the primary tier."""
+        parent = self._writeback_parent
+        chain: list[OffloadKey] = []
+        k: OffloadKey | None = key
+        while k is not None and self._flushable(wb, k, taken):
+            chain.append(k)
+            taken.add(k)
+            k = parent.get(k)
+        chain.reverse()
+        unit: list[list[OffloadKey]] = []
+        groups = self._writeback_groups
+        for k in chain:
+            chunk = [k]
+            chunk_hash = k[:-4]
+            for group in groups:
+                sibling = OffloadKey(chunk_hash + group)
+                if sibling != k and self._flushable(wb, sibling, taken):
+                    chunk.append(sibling)
+                    taken.add(sibling)
+            unit.append(chunk)
+        return unit
+
+    def _writeback_step(self, wb: _WritebackState) -> None:
+        """Once per scheduler step. While the primary tier holds at least
+        ``high_chunks`` chunks, write the coldest unwritten chunks (in the
+        primary's eviction order) to ``wb.tier`` until at most ``low_chunks``
+        are left unwritten, or the tier declines (store backlog cap, breaker).
+        Eviction itself never waits: a chunk evicted before its write
+        started is lost to the tier (counted in writeback_lost_blocks)."""
+        primary = self.primary_tier
+        if primary.num_used_chunks() < wb.high_chunks:
+            return
+        need = len(wb.dirty) - len(wb.flushing) - wb.low_chunks
+        if need <= 0:
+            return
+        # Plan first: pinning below changes the evictable set being iterated.
+        # A unit is taken oldest chunk first and cut off once ``need`` chunks
+        # are planned (overshooting by at most one chunk's group siblings);
+        # the rest of a long prefix follows on later steps, so one step never
+        # pins much more than it has to.
+        units: list[list[OffloadKey]] = []
+        taken: set[OffloadKey] = set()
+        for key in primary.iter_evictable():
+            if key not in wb.dirty or key in taken or key in wb.flushing:
+                continue
+            for unit in self._plan_writeback_unit(wb, key, taken):
+                if need <= 0:
+                    break
+                units.append(unit)
+                need -= len(unit)
+            if need <= 0:
+                break
+        # Submit oldest prefix chunks first, in jobs of about
+        # _WRITEBACK_JOB_CHUNKS; a chunk's group siblings share a job.
+        batch: list[OffloadKey] = []
+        for unit in units:
+            batch.extend(unit)
+            if len(batch) >= _WRITEBACK_JOB_CHUNKS:
+                if not self._submit_writeback(wb, batch):
+                    return
+                batch = []
+        if batch:
+            self._submit_writeback(wb, batch)
+
+    def _submit_writeback(self, wb: _WritebackState, keys: list[OffloadKey]) -> bool:
+        job = self._submit_store_to_tier(wb.tier_idx, keys, self._writeback_ctx)
+        if job is None:
+            return False
+        self._writeback_jobs[job.job_id] = wb
+        wb.flushing.update(keys)
+        return True
+
+    def _finish_writeback_job(
+        self,
+        wb: _WritebackState,
+        keys: Collection[OffloadKey],
+        success: bool,
+    ) -> None:
+        """A write-back job finished (its chunks are already unpinned)."""
+        primary = self.primary_tier
+        to_demote: list[OffloadKey] = []
+        for key in keys:
+            wb.flushing.discard(key)
+            stored = wb.tier.is_stored(key)
+            if stored is None:
+                stored = success
+            if stored and key in wb.dirty:
+                wb.dirty.discard(key)
+                wb.n_flushed += 1
+            if key in wb.touched:
+                wb.touched.discard(key)
+                continue  # used by a request meanwhile: keep its recency
+            chunk = primary.get_chunk(key)
+            if chunk is not None and chunk.ref_cnt == 0:
+                to_demote.append(key)
+        # Put the chunks no request used during the write at the LRU end
+        # (prefix chunks included, or a stale conversation head would stay
+        # ahead of recent chunks), so the next evictions take written chunks
+        # first.
+        if to_demote:
+            primary.demote(to_demote)
 
     @override
     def on_new_request(
@@ -866,6 +1163,8 @@ class TieringOffloadingManager(OffloadingManager):
             for tier_idx, tier in enumerate(self.secondary_tiers):
                 if tier_idx != exclude_tier_idx:
                     tier.touch(keys, req_context)
+            if self._writeback:
+                self._note_writeback_use(keys, learn_prefix=True)
 
     def _maybe_finalize_request(
         self,
@@ -914,6 +1213,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._flush_pending_promotions()
         self._flush_pending_cascades()
+        for wb in self._writeback.values():
+            self._writeback_step(wb)
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
@@ -986,6 +1287,13 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        for wb in self._writeback.values():
+            wb.n_lost += len(wb.dirty)  # unwritten chunks dropped with the cache
+            wb.dirty.clear()
+            wb.flushing.clear()
+            wb.touched.clear()
+        self._writeback_jobs.clear()
+        self._writeback_parent.clear()
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]
@@ -1009,6 +1317,24 @@ class TieringOffloadingManager(OffloadingManager):
                 stats = metrics_stats
             else:
                 stats.aggregate(metrics_stats)
+
+        if self._writeback:
+            m = TieringOffloadingMetrics
+            wb_stats = OffloadingConnectorStats()
+            n_dirty = 0
+            for wb in self._writeback.values():
+                n_dirty += len(wb.dirty)
+                if wb.n_flushed:
+                    wb_stats.increase_counter(m.WRITEBACK_FLUSHED, wb.n_flushed)
+                    wb.n_flushed = 0
+                if wb.n_lost:
+                    wb_stats.increase_counter(m.WRITEBACK_LOST, wb.n_lost)
+                    wb.n_lost = 0
+            wb_stats.set_gauge(m.WRITEBACK_DIRTY, n_dirty)
+            if stats is None:
+                stats = wb_stats
+            else:
+                stats.aggregate(wb_stats)
 
         for tier in self.secondary_tiers:
             tier_stats = tier.get_stats()

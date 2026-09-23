@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import heapq
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 
 from typing_extensions import override
 
@@ -33,6 +33,8 @@ class LRUCachePolicy(CachePolicy):
         self._evictable: set[OffloadKey] = set()
         self._heap: list[tuple[int, OffloadKey]] = []
         self._next_rank = 0
+        # Ranks handed out by demote(), below every rank _next_rank gives.
+        self._demoted_rank = 0
 
     def _assign_new_rank(self, key: OffloadKey) -> bool:
         if key not in self.chunks:
@@ -110,6 +112,7 @@ class LRUCachePolicy(CachePolicy):
         self._evictable.clear()
         self._heap.clear()
         self._next_rank = 0
+        self._demoted_rank = 0
 
     @override
     def evict(
@@ -171,3 +174,19 @@ class LRUCachePolicy(CachePolicy):
     def mark_non_evictable(self, key: OffloadKey) -> None:
         # key must have been evictable before it was pinned.
         self._evictable.remove(key)
+
+    @override
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        # evict() takes the lowest rank first.
+        return iter(sorted(self._evictable, key=self._ranks.__getitem__))
+
+    @override
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        # Unpinning keeps a chunk's rank, so this moves them explicitly: ranks
+        # below every other chunk, the first key lowest.
+        for key in reversed(list(keys)):
+            if key in self._evictable:
+                self._demoted_rank -= 1
+                self._ranks[key] = self._demoted_rank
+                self._push_evictable(key)
+        self._maybe_compact_heap()
