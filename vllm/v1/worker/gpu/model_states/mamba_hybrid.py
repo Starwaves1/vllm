@@ -100,8 +100,18 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
+            # port(kvarn-v2): use the MAMBA spec block size, not
+            # cache_config.block_size -- with an explicit --block-size (KVarN
+            # needs 128) the two diverge (128 vs 2176) and the seed indexes far
+            # past the mamba block table -> illegal memory access in the align
+            # precopy on prefix-cache resume. _mamba_spec is populated by the
+            # first batch's preprocess_state; resumes can only happen after
+            # that, and fresh requests (num_computed==0) seed -1 either way.
+            mamba_bs = (self._mamba_spec.block_size
+                        if self._mamba_spec is not None
+                        else self.cache_config.block_size)
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // mamba_bs
             )
 
     def _get_mamba_group_info(

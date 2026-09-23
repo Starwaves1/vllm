@@ -912,9 +912,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
         # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        # port(kvarn-v2): the drafter's SW block need not line up with the hash unit
+        # in either direction. It is usually smaller (16 against a 2176 unit), but at
+        # some draft lengths the page arithmetic promotes it larger instead -- 2048
+        # against a 128 unit at DFLASH_TOKENS=3, which clears the divisibility check
+        # below and then trips the upstream assert on the first request, killing the
+        # engine (issue #18). Neither case can serve a fine-grained hit, and prefix
+        # reuse is meaningless for a rolling window anyway, so report a clean miss
+        # for both instead of asserting.
+        if (kv_cache_spec.block_size % block_pool.hash_block_size != 0
+                or alignment_tokens % kv_cache_spec.block_size != 0):
+            return tuple([] for _ in kv_cache_group_ids), 0
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1090,6 +1098,20 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         window in the future.
         """
         return 0
+
+    def cache_blocks(
+        self, request, num_tokens: int, retention_interval: int | None = None
+    ) -> None:
+        # port(kvarn-v2): write-side twin of the read short-circuit above —
+        # when the SW block does not divide the hash unit, skip caching this
+        # group instead of asserting in resolve_block_hashes. Rolling-window
+        # reuse is meaningless, so nothing is lost. This is also the assert
+        # reported from cache_full_blocks -> resolve_block_hashes when the
+        # flag is dropped, and on multi-GPU geometries where per-GPU page
+        # sizes give the SW group a block the hash unit no longer divides.
+        if self.block_size % self.block_pool.hash_block_size != 0:
+            return
+        super().cache_blocks(request, num_tokens, retention_interval)
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):

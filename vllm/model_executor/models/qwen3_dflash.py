@@ -222,6 +222,11 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
+        # port(kvarn-v2): KVarN has no sliding-window path — drafter layers stay bf16.
+        if cache_config is not None and str(getattr(cache_config, "cache_dtype", "auto")).startswith("kvarn"):
+            from copy import copy as _kv_copy
+            cache_config = _kv_copy(cache_config)
+            cache_config.cache_dtype = "auto"
         self.attn = Attention(
             self.num_heads,
             self.head_dim,

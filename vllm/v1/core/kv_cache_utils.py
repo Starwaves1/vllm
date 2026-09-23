@@ -656,6 +656,16 @@ def resolve_kv_cache_block_sizes(
         else g.kv_cache_spec.block_size
         for g in groups
     ]
+    # port(kvarn-v2): sliding-window groups (the DFlash drafter) take no part
+    # in prefix matching and must not skew the LCM/GCD; their block is a
+    # divisor of the primary block by construction.
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec as _SWS
+    _non_sw = [
+        bs for g, bs in zip(groups, group_block_sizes)
+        if not isinstance(g.kv_cache_spec, _SWS)
+    ]
+    if _non_sw:
+        group_block_sizes = _non_sw
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
@@ -668,7 +678,9 @@ def resolve_kv_cache_block_sizes(
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
     # scheduler block size.
-    if any(
+    # port(kvarn-v2): an explicit --prefix-match-unit beats the mamba
+    # divergence fallback (which used to silently ignore it).
+    if cache_config.prefix_match_unit is None and any(
         isinstance(g.kv_cache_spec, MambaSpec)
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups

@@ -110,8 +110,33 @@ def _largest_kernel_block_within(
 
     sizes = attn_backend.get_supported_kernel_block_sizes()
     candidates = [s for s in sizes if isinstance(s, int)]
+    # port(kvarn-v2): MultipleOf backends (FA2: MultipleOf(16)) support ANY
+    # multiple — scale up to the page budget instead of offering only the base,
+    # or every 16-token SW block burns a whole shared page.
+    mults = [s.base for s in sizes if isinstance(s, MultipleOf)]
+    if mults and page_budget and per_token_bytes > 0:
+        base = min(mults)
+        budget_tokens = page_budget // per_token_bytes
+        scaled = budget_tokens // base * base
+        # port(kvarn-v2): prefer a DIVISOR of ``fallback`` (the primary
+        # block) so the scheduler LCM and the prefix hash work out — otherwise
+        # the SW block breaks block-size uniformity.
+        if fallback and fallback > 0:
+            # KVarN tile compatibility: prefer multiples of 128, then any
+            # divisor of the primary block.
+            for step in (128, base):
+                found = 0
+                for d in range(budget_tokens, step - 1, -1):
+                    if fallback % d == 0 and d % step == 0:
+                        found = d
+                        break
+                if found:
+                    scaled = found
+                    break
+        if scaled >= base:
+            candidates.append(scaled)
     if not candidates:
-        candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
+        candidates = mults
     if not candidates:
         return fallback
     smallest = min(candidates)
@@ -643,6 +668,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # bytes per block. Otherwise (page_size_padded is None) the smallest
             # block is fine — ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # port(kvarn-v2): hybrid without skip layers — pad the drafter's
+            # SW pages to the mamba/primary page instead of wasting 16-token
+            # blocks inside 1.8 MB uniform pages (26x overhead).
+            if shared_page is None and str(
+                vllm_config.cache_config.cache_dtype
+            ).startswith("kvarn"):
+                shared_page = vllm_config.cache_config.mamba_page_size_padded
             sw_per_token = SlidingWindowSpec(
                 block_size=1,
                 num_kv_heads=self.num_kv_heads,

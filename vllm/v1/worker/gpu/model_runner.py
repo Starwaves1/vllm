@@ -1252,6 +1252,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        # port(kvarn-v2): a batch that still contains PREFILL tokens is not a uniform
+        # DECODE batch, however evenly its tokens happen to divide. get_uniform_token_count
+        # only checks num_toks == max_query_len * num_reqs, so a lone request whose final
+        # prefill chunk is exactly decode_query_len tokens reports uniform and replays the
+        # captured spec-verify graph over prompt tokens. With --prefix-match-unit 128 and a
+        # prefix-cache hit the scheduler cuts that last chunk at (prompt_len % 128), so this
+        # fires on exactly one prompt length in every 128 -- Bug B (docs/gotchas.md 37).
+        if uniform_tok_count is not None and not dummy_run:
+            ncomp = self.req_states.num_computed_tokens_np
+            pfill = self.req_states.prefill_len.np
+            idx_of = self.req_states.req_id_to_index
+            for _req_id in scheduler_output.num_scheduled_tokens:
+                _i = idx_of.get(_req_id)
+                if _i is not None and ncomp[_i] < pfill[_i]:
+                    uniform_tok_count = None
+                    break
 
         num_active_loras = 0
         if self.lora_config:

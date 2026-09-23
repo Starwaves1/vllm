@@ -106,6 +106,11 @@ def _selector_walk_kernel(
             realized,
             mask=mask & valid,
         )
+        # port(kvarn-v2): NaN scores make `scores == best` match nowhere, so
+        # index becomes BLOCK_K and the load below reads past the candidate
+        # row -- a garbage token id that later kills the embedding gather.
+        # Clamp to candidate 0; a wrong draft is just rejected by the verify.
+        index = tl.where(index >= top_k, 0, index)
         token = tl.load(candidate_ptr + candidate_base + index, mask=valid, other=0)
         tl.store(tokens_ptr + flat, token, mask=valid)
         previous = index
@@ -161,7 +166,9 @@ class DFlash2Speculator(DFlashSpeculator):
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
-        self._selector_tokens = torch.empty(
+        # port(kvarn-v2): zeros, not empty -- an unwritten slot must hold a
+        # valid token id, never uninitialized VRAM.
+        self._selector_tokens = torch.zeros(
             (self.max_num_reqs, self.draft_block),
             dtype=self.draft_tokens.dtype,
             device=device,
@@ -424,6 +431,14 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        # port(kvarn-v2): degenerate (ultra-peaked) distributions can NaN the
+        # selector scores -- KVarN quantization noise on verbatim-reproduction
+        # content tips them over. NaN poisons both the path walk (index runs
+        # past the candidate row) and the cached draft logits the rejection
+        # sampler divides by, silently accepting wrong tokens. Sanitize to
+        # finite values: affected candidates keep a valid q, verify stays
+        # exact. Pure GPU op, cudagraph-capture-safe.
+        scores = torch.nan_to_num(scores, nan=-1e30, posinf=1e30, neginf=-1e30)
         self._sample_path(candidate_ids, scores, num_reqs)
         self._cache_draft_logits(candidate_ids, num_sample)
         self.draft_tokens[:num_reqs, : self.draft_block].copy_(

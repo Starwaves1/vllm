@@ -560,8 +560,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
+        # port(kvarn-v2): sliding-window groups (the DFlash drafter) take no
+        # part in prefix matching; for them it suffices that the hash unit is
+        # an integer multiple of their block (e.g. 2176 = 17 x 128).
         assert all(
-            block_size % hash_block_size == 0 for block_size in group_block_sizes
+            block_size % hash_block_size == 0
+            or hash_block_size % block_size == 0
+            for block_size in group_block_sizes
         ), (
             "Each KV cache group's real block_size must be divisible by "
             f"hash_block_size. block_sizes={group_block_sizes}, "
