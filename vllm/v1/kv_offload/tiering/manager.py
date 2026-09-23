@@ -18,10 +18,15 @@ Key Design Principles:
    "data is being promoted, try later"
 5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
    protecting blocks from eviction until complete_read() is called
+
+Write-back tiers (store_policy "write_back") are the exception to 1: blocks are
+not cascaded on store. Once per step, while the primary tier is filled to its
+high watermark, the coldest blocks such a tier lacks are written to it (see
+_writeback_step), so a block evicted later is still on the secondary tier.
 """
 
 import time
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -45,12 +50,15 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
+    WRITEBACK_REQ_ID,
     JobId,
     JobMetadata,
     ParentManager,
     SecondaryTierManager,
+    StorePolicy,
     TieringOffloadingMetrics,
 )
 
@@ -64,6 +72,34 @@ class PendingPromotion:
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
+
+
+# Max blocks per write-back store job. A job's blocks stay pinned until its
+# last block is written, so small jobs release CPU slots sooner.
+_WRITEBACK_JOB_BLOCKS = 16
+
+
+@dataclass
+class _WritebackState:
+    """Write-back bookkeeping for one secondary tier (scheduler thread)."""
+
+    tier: SecondaryTierManager
+    # Primary-tier occupancy (blocks) at which flushing starts, and the number
+    # of unwritten blocks it flushes down to.
+    high_blocks: int
+    low_blocks: int
+    # Blocks in the primary tier that this tier does not hold yet. Includes
+    # the blocks being written (``flushing``).
+    dirty: set[OffloadKey] = field(default_factory=set)
+    # Blocks pinned by an in-flight write-back job.
+    flushing: set[OffloadKey] = field(default_factory=set)
+    # Blocks the flusher picked as cold (not pulled in as a prefix or group
+    # sibling): moved back to the LRU end when their write finishes.
+    demote: set[OffloadKey] = field(default_factory=set)
+    # Flushing blocks read or touched by a request meanwhile: not demoted.
+    touched: set[OffloadKey] = field(default_factory=set)
+    n_flushed: int = 0
+    n_lost: int = 0
 
 
 @dataclass(slots=True)
@@ -112,6 +148,46 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+        # Called with the keys of blocks evicted by prepare_store/prepare_write.
+        self.eviction_listener: Callable[[list[OffloadKey]], None] | None = None
+
+    @override
+    def prepare_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        result = super().prepare_store(keys, req_context)
+        if (
+            result is not None
+            and result.evicted_keys
+            and self.eviction_listener is not None
+        ):
+            self.eviction_listener(result.evicted_keys)
+        return result
+
+    # --- write-back support (read-only views of the cache policy) ---
+
+    @property
+    def num_blocks(self) -> int:
+        return self._num_blocks
+
+    def num_used_blocks(self) -> int:
+        """Slots holding a block (ready, being written, or pinned)."""
+        return self._num_allocated_blocks - len(self._free_list)
+
+    def get_block(self, key: OffloadKey) -> BlockStatus | None:
+        return self._policy.get(key)
+
+    def supports_writeback(self) -> bool:
+        return type(self._policy).iter_evictable is not CachePolicy.iter_evictable
+
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        """Evictable blocks, next eviction victim first. Do not change the
+        primary tier while iterating."""
+        return self._policy.iter_evictable()
+
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        """Make evictable ``keys`` the next eviction victims."""
+        self._policy.demote(keys)
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
@@ -224,6 +300,36 @@ class TieringOffloadingManager(OffloadingManager):
         # get_stats() calls; merged in and reset each time get_stats() runs.
         self._stats = OffloadingConnectorStats()
 
+        # Write-back tiers (store_policy "write_back"), see _writeback_step().
+        self._writeback: dict[SecondaryTierManager, _WritebackState] = {}
+        for tier in self.secondary_tiers:
+            if tier.store_policy != StorePolicy.WRITE_BACK:
+                continue
+            if not primary_tier.supports_writeback():
+                raise ValueError(
+                    f"store_policy 'write_back' on secondary tier "
+                    f"'{tier.tier_type}' needs a primary cache policy that "
+                    "implements CachePolicy.iter_evictable() (lru, arc)"
+                )
+            n = primary_tier.num_blocks
+            self._writeback[tier] = _WritebackState(
+                tier=tier,
+                high_blocks=max(1, int(n * tier.writeback_high_watermark)),
+                low_blocks=int(n * tier.writeback_low_watermark),
+            )
+        self._writeback_jobs: dict[JobId, _WritebackState] = {}
+        # Prefix links learned from touch(): key -> key of the preceding chunk
+        # of the same KV cache group, for keys in the primary tier. A block
+        # hash chains its parent's, so a link never changes. Pruned on primary
+        # eviction; reset if it ever outgrows the primary (failed stores).
+        self._writeback_parent: dict[OffloadKey, OffloadKey] = {}
+        # Group-index suffixes of the keys seen (in order), to find a chunk's
+        # siblings.
+        self._writeback_groups: dict[bytes, None] = {}
+        self._writeback_ctx = ReqContext(req_id=WRITEBACK_REQ_ID)
+        if self._writeback:
+            primary_tier.eviction_listener = self._on_primary_evicted
+
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
         job_id = self._job_id_counter
@@ -277,6 +383,11 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+                    wb = self._writeback_jobs.pop(job_id, None)
+                    if wb is not None:
+                        self._finish_writeback_job(
+                            wb, job_id, job_metadata.keys, completed_job.success
+                        )
 
     @override
     def lookup(
@@ -477,6 +588,8 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
+        if self._writeback:
+            self._note_writeback_use(keys)
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -491,6 +604,8 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
+        if self._writeback:
+            self._note_writeback_use(keys, learn_prefix=True)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -624,7 +739,11 @@ class TieringOffloadingManager(OffloadingManager):
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
             for tier in self.secondary_tiers:
-                self._submit_store_to_tier(tier, keys, req_context)
+                wb = self._writeback.get(tier)
+                if wb is None:
+                    self._submit_store_to_tier(tier, keys, req_context)
+                else:
+                    self._mark_dirty(wb, keys)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -639,15 +758,16 @@ class TieringOffloadingManager(OffloadingManager):
         tier: SecondaryTierManager,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> bool:
+    ) -> JobMetadata | None:
         """Pin ``keys`` in the primary tier and submit a store job to ``tier``,
         unless the tier declines the batch (accepts_store(), e.g. its write
-        backlog is full or it is disabled). Returns whether a job was
-        submitted; a declined batch is not pinned."""
+        backlog is full or it is disabled). Returns the submitted job, or None
+        if the batch was declined (and not pinned)."""
         if not tier.accepts_store(keys, req_context):
-            return False
-        tier.submit_store(self.create_store_job(keys, req_context))
-        return True
+            return None
+        job_metadata = self.create_store_job(keys, req_context)
+        tier.submit_store(job_metadata)
+        return job_metadata
 
     def create_store_job(
         self,
@@ -675,6 +795,182 @@ class TieringOffloadingManager(OffloadingManager):
         )
         self._transfer_jobs[job_id] = job_metadata
         return job_metadata
+
+    # ------------------------------------------------------------------
+    # Write-back (store_policy "write_back")
+    # ------------------------------------------------------------------
+
+    def _mark_dirty(self, wb: _WritebackState, keys: Collection[OffloadKey]) -> None:
+        """Blocks just stored in the primary tier: remember the ones ``wb``'s
+        tier lacks instead of cascading them."""
+        get_block = self.primary_tier.get_block
+        is_stored = wb.tier.is_stored
+        for key in keys:
+            block = get_block(key)
+            if block is None or not block.is_ready or is_stored(key):
+                continue
+            wb.dirty.add(key)
+            self._writeback_groups.setdefault(key[-4:])
+
+    def _on_primary_evicted(self, keys: list[OffloadKey]) -> None:
+        for wb in self._writeback.values():
+            dirty = wb.dirty
+            for key in keys:
+                if key in dirty:
+                    dirty.discard(key)
+                    wb.n_lost += 1
+        parent = self._writeback_parent
+        for key in keys:
+            parent.pop(key, None)
+
+    def _note_writeback_use(
+        self, keys: Collection[OffloadKey], learn_prefix: bool = False
+    ) -> None:
+        """Learn prefix links from a request's ordered keys (touch() gets one
+        KV cache group's keys in chunk order), and note flushing blocks that
+        are in use, so they are not demoted when their write finishes."""
+        flushing = [wb for wb in self._writeback.values() if wb.flushing]
+        if learn_prefix:
+            parent = self._writeback_parent
+            get_block = self.primary_tier.get_block
+            prev = None
+            for key in keys:
+                if (
+                    prev is not None
+                    and key not in parent
+                    and get_block(key) is not None
+                ):
+                    parent[key] = prev
+                prev = key
+            if len(parent) > 2 * self.primary_tier.num_blocks:
+                parent.clear()  # links are re-learned on the next touches
+        for wb in flushing:
+            for key in keys:
+                if key in wb.flushing:
+                    wb.touched.add(key)
+
+    def _flushable(
+        self, wb: _WritebackState, key: OffloadKey, taken: set[OffloadKey]
+    ) -> bool:
+        if key not in wb.dirty or key in wb.flushing or key in taken:
+            return False
+        block = self.primary_tier.get_block(key)
+        # ref_cnt -1: still being written from the GPU (or promoted); never
+        # read it. Dirty blocks are always ready; this is a safety net.
+        return block is not None and block.is_ready
+
+    def _plan_writeback_unit(
+        self, wb: _WritebackState, key: OffloadKey, taken: set[OffloadKey]
+    ) -> list[list[OffloadKey]]:
+        """``key`` plus the unwritten earlier chunks of its prefix (oldest
+        first), each with its unwritten siblings of the other KV cache groups.
+
+        A secondary-tier hit needs every chunk before it (prefix lookup stops
+        at the first miss) and, for a hybrid model, the blocks of all groups
+        at the hit boundary. The prefix walk stops at the first chunk that is
+        already written, being written, or not in the primary tier."""
+        parent = self._writeback_parent
+        chain: list[OffloadKey] = []
+        k: OffloadKey | None = key
+        while k is not None and self._flushable(wb, k, taken):
+            chain.append(k)
+            taken.add(k)
+            k = parent.get(k)
+        chain.reverse()
+        unit: list[list[OffloadKey]] = []
+        groups = self._writeback_groups
+        for k in chain:
+            chunk = [k]
+            block_hash = k[:-4]
+            for group in groups:
+                sibling = OffloadKey(block_hash + group)
+                if sibling != k and self._flushable(wb, sibling, taken):
+                    chunk.append(sibling)
+                    taken.add(sibling)
+            unit.append(chunk)
+        return unit
+
+    def _writeback_step(self, wb: _WritebackState) -> None:
+        """Once per scheduler step. While the primary tier holds at least
+        ``high_blocks`` blocks, write the coldest unwritten blocks (in the
+        primary's eviction order) to ``wb.tier`` until at most ``low_blocks``
+        are left unwritten, or the tier declines (store backlog cap, breaker).
+        Eviction itself never waits: a block evicted before its write
+        started is lost to the tier (counted in writeback_lost_blocks)."""
+        primary = self.primary_tier
+        if primary.num_used_blocks() < wb.high_blocks:
+            return
+        need = len(wb.dirty) - len(wb.flushing) - wb.low_blocks
+        if need <= 0:
+            return
+        # Plan first: pinning below changes the evictable set being iterated.
+        # Each planned chunk: (keys of the chunk's groups, picked as cold?).
+        chunks: list[tuple[list[OffloadKey], bool]] = []
+        taken: set[OffloadKey] = set()
+        for key in primary.iter_evictable():
+            if key not in wb.dirty or key in taken or key in wb.flushing:
+                continue
+            unit = self._plan_writeback_unit(wb, key, taken)
+            for chunk in unit:
+                chunks.append((chunk, chunk[0] == key))
+                need -= len(chunk)
+            if need <= 0:
+                break
+        # Submit oldest prefix chunks first, in jobs of about
+        # _WRITEBACK_JOB_BLOCKS; a chunk's group siblings share a job.
+        batch: list[OffloadKey] = []
+        demote: list[OffloadKey] = []
+        for chunk, is_cold in chunks:
+            batch.extend(chunk)
+            if is_cold:
+                demote.extend(chunk)
+            if len(batch) >= _WRITEBACK_JOB_BLOCKS:
+                if not self._submit_writeback(wb, batch, demote):
+                    return
+                batch, demote = [], []
+        if batch:
+            self._submit_writeback(wb, batch, demote)
+
+    def _submit_writeback(
+        self, wb: _WritebackState, keys: list[OffloadKey], demote: list[OffloadKey]
+    ) -> bool:
+        job = self._submit_store_to_tier(wb.tier, keys, self._writeback_ctx)
+        if job is None:
+            return False
+        self._writeback_jobs[job.job_id] = wb
+        wb.flushing.update(keys)
+        wb.demote.update(demote)
+        return True
+
+    def _finish_writeback_job(
+        self,
+        wb: _WritebackState,
+        job_id: JobId,
+        keys: Collection[OffloadKey],
+        success: bool,
+    ) -> None:
+        """A write-back job finished (its blocks are already unpinned)."""
+        primary = self.primary_tier
+        to_demote: list[OffloadKey] = []
+        for key in keys:
+            wb.flushing.discard(key)
+            stored = wb.tier.is_stored(key)
+            if stored is None:
+                stored = success
+            if stored and key in wb.dirty:
+                wb.dirty.discard(key)
+                wb.n_flushed += 1
+            used = key in wb.touched
+            wb.touched.discard(key)
+            if key in wb.demote:
+                wb.demote.discard(key)
+                block = primary.get_block(key)
+                if not used and block is not None and block.ref_cnt == 0:
+                    to_demote.append(key)
+        # Unpinning made them most recently used; put the cold blocks back at
+        # the LRU end so the next evictions take written blocks first.
+        if to_demote:
+            primary.demote(to_demote)
 
     @override
     def on_new_request(
@@ -765,6 +1061,8 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
         self._flush_pending_promotions()
+        for wb in self._writeback.values():
+            self._writeback_step(wb)
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
 
@@ -833,6 +1131,14 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        for wb in self._writeback.values():
+            wb.n_lost += len(wb.dirty)  # unwritten blocks dropped with the cache
+            wb.dirty.clear()
+            wb.flushing.clear()
+            wb.demote.clear()
+            wb.touched.clear()
+        self._writeback_jobs.clear()
+        self._writeback_parent.clear()
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]
@@ -840,6 +1146,19 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
+        if self._writeback:
+            m = TieringOffloadingMetrics
+            n_dirty = 0
+            for wb in self._writeback.values():
+                n_dirty += len(wb.dirty)
+                if wb.n_flushed:
+                    self._stats.increase_counter(m.WRITEBACK_FLUSHED, wb.n_flushed)
+                    wb.n_flushed = 0
+                if wb.n_lost:
+                    self._stats.increase_counter(m.WRITEBACK_LOST, wb.n_lost)
+                    wb.n_lost = 0
+            self._stats.set_gauge(m.WRITEBACK_DIRTY, n_dirty)
+
         stats = self.primary_tier.get_stats()
 
         if stats is not None and stats.is_empty():

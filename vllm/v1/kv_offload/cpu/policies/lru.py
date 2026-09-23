@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from typing_extensions import override
 
@@ -88,3 +88,15 @@ class LRUCachePolicy(CachePolicy):
     def mark_non_evictable(self, key: OffloadKey) -> None:
         # key must have been in the evictable list.
         del self.evictable_blocks[key]
+
+    @override
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        return iter(self.evictable_blocks)
+
+    @override
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        # Unpinning re-appends a block at the MRU end (mark_evictable); this
+        # moves it back to the LRU end.
+        for key in reversed(list(keys)):
+            if key in self.evictable_blocks:
+                self.evictable_blocks.move_to_end(key, last=False)

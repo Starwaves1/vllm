@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from typing_extensions import override
 
@@ -107,6 +107,18 @@ class ARCCachePolicy(CachePolicy):
         self.b1.clear()
         self.b2.clear()
         self.target_t1_size = 0.0
+
+    @override
+    def iter_evictable(self) -> Iterator[OffloadKey]:
+        # evict() drains T1 first while it is at or over its target size.
+        if len(self.t1) >= int(self.target_t1_size):
+            lists = (self.t1, self.t2)
+        else:
+            lists = (self.t2, self.t1)
+        for blocks in lists:
+            for key, block in blocks.items():
+                if block.ref_cnt == 0:
+                    yield key
 
     @override
     def evict(

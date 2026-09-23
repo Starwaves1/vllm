@@ -34,12 +34,28 @@ class SecondaryTierFactory:
         tier_cls = cls.get_tier_class(tier_config)
         config = tier_config.copy()
         tier_type = config.pop("type")
-        return tier_cls(
+        # Handled by the tiering manager for every tier type.
+        store_policy_config = {
+            name: config.pop(name)
+            for name in (
+                "store_policy",
+                "writeback_high_watermark",
+                "writeback_low_watermark",
+            )
+            if name in config
+        }
+        tier = tier_cls(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
             tier_type=tier_type,
             **config,
         )
+        try:
+            tier.configure_store_policy(**store_policy_config)
+        except Exception:
+            tier.shutdown()
+            raise
+        return tier
 
     @classmethod
     def get_tier_class(cls, tier_config: dict) -> type[SecondaryTierManager]:
