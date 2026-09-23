@@ -31,6 +31,45 @@ else:
 
 logger = init_logger(__name__)
 
+# syv patch (xgrammar-bounded-string-ctrl): see XgrammarBackend._compile_json_schema.
+_STRICT_STRINGS = __import__("os").environ.get("VLLM_XGRAMMAR_STRICT_STRINGS", "1") != "0"
+# The character rule xgrammar prints for length-bounded JSON strings ...
+_XGR_BOUNDED_CHAR_BODY = r'(([^\"\\\r\n]))'
+# ... and its JSON-valid replacement: no control characters. No escape branch
+# (stock xgrammar offers none here either): an alternation inside the bounded
+# repetition {m,n} defeats xgrammar's character-class repetition fast path, and
+# the mask cost grew with the position in the string: 0.5 s -> 2.7 s per
+# fill_next_token_bitmask at 40-130 chars into a maxLength-200 string (stock:
+# ~0.1 ms). Under MTP k=3 the scheduler fills up to 4 masks per request per
+# step, so one such request stalled the whole engine for minutes (cheese-lab
+# 2026-09-23 03:15-03:22 and 03:47-). A plain class keeps the fast path.
+_JSON_STRING_CHAR_BODY = r'(([^\0-\x1f\"\\]))'
+_JSON_STRING_ESCAPE_RULE = (
+    r'syv_json_string_escape ::= (([\"\\/bfnrt]) | '
+    r'("u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]))'
+)
+
+
+def fix_bounded_json_string_chars(ebnf: str) -> str | None:
+    """Rewrite xgrammar's length-bounded JSON string character rules.
+
+    Returns the rewritten EBNF, or None when the grammar has no such rule.
+    """
+    out = []
+    changed = False
+    for line in ebnf.splitlines():
+        name, sep, body = line.partition(" ::= ")
+        if sep and body.strip() == _XGR_BOUNDED_CHAR_BODY:
+            out.append(f"{name} ::= {_JSON_STRING_CHAR_BODY}")
+            changed = True
+        else:
+            out.append(line)
+    if not changed:
+        return None
+    if "syv_json_string_escape" in _JSON_STRING_CHAR_BODY:
+        out.append(_JSON_STRING_ESCAPE_RULE)
+    return "\n".join(out) + "\n"
+
 
 @dataclass
 class XgrammarBackend(StructuredOutputBackend):
@@ -79,9 +118,7 @@ class XgrammarBackend(StructuredOutputBackend):
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
-            ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
-            )
+            ctx = self._compile_json_schema(grammar_spec)
         elif request_type == StructuredOutputOptions.JSON_OBJECT:
             ctx = self.compiler.compile_json_schema(
                 '{"type": "object"}', any_whitespace=not self.disable_any_whitespace
@@ -123,6 +160,42 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+        )
+
+    def _compile_json_schema(self, schema: str) -> "xgr.CompiledGrammar":
+        r"""syv patch (xgrammar-bounded-string-ctrl): compile a JSON schema with
+        JSON-valid characters in length-bounded strings.
+
+        xgrammar (0.2.3 through at least 0.2.7) turns a string with
+        minLength/maxLength into ``"\"" char{m,n} "\""`` with
+        ``char ::= [^\"\\\r\n]``. That class admits raw control characters
+        (TAB, 0x00-0x1f except CR/LF), which make the output invalid JSON, and
+        it has no escape branch, so ``\\"`` or ``\\t`` cannot be written at all.
+        The unbounded string rule is correct (``[^\0-\x1f\"\\\r\n]`` or an
+        escape). This rewrites the bounded character rule to
+        ``[^\0-\x1f\"\\]``: no raw control characters. Escapes stay
+        unavailable in bounded strings, as in stock xgrammar: an escape branch
+        inside the bounded repetition made mask filling cost seconds per token
+        (see _JSON_STRING_CHAR_BODY). Any failure falls back to the stock
+        compile. VLLM_XGRAMMAR_STRICT_STRINGS=0 disables it.
+        """
+        any_whitespace = not self.disable_any_whitespace
+        if _STRICT_STRINGS:
+            try:
+                ebnf = str(
+                    xgr.Grammar.from_json_schema(schema, any_whitespace=any_whitespace)
+                )
+                fixed = fix_bounded_json_string_chars(ebnf)
+                if fixed is not None:
+                    return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(fixed))
+            except Exception:
+                logger.warning(
+                    "strict JSON string rewrite failed; using the stock xgrammar "
+                    "JSON schema compile",
+                    exc_info=True,
+                )
+        return self.compiler.compile_json_schema(
+            schema, any_whitespace=any_whitespace
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
