@@ -65,6 +65,17 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# BUG #2 (async-KV-onload admission livelock): consecutive engine steps an
+# offloaded-prefix load candidate may fail the full-ISL admission reservation
+# before the scheduler abandons the async load and recomputes the suffix
+# locally. Kept small: at the engine's waiting-loop retry rate this is on the
+# order of ~10 ms of added latency, negligible next to the multi-second prefix
+# recompute it guards, yet large enough to ride out transient contention (an
+# in-flight prefill's reservation draining, blocks freeing next step) so a load
+# that could still be admitted is not abandoned prematurely. The exact value is
+# not sensitive; anything in ~4-16 behaves identically here.
+ASYNC_LOAD_ADMIT_MAX_FAILS = 8
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -329,6 +340,11 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        # BUG #2: per-request count of consecutive engine steps an async
+        # KV-load candidate failed the full-ISL admission reservation. Once it
+        # reaches ASYNC_LOAD_ADMIT_MAX_FAILS the request abandons the offloaded
+        # load and recomputes locally. Cleared on admission or finish.
+        self._async_load_admit_fails: dict[str, int] = {}
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -738,6 +754,11 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                # BUG #2: set when a repeatedly-unadmittable async load is
+                # abandoned this pass in favor of local recompute. Gates off the
+                # full-ISL reservation so the degraded request is admitted via
+                # ordinary chunked prefill.
+                degraded_async_load = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
@@ -830,6 +851,36 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    # BUG #2: an async-load candidate whose offloaded-prefix hit
+                    # cannot pass the full-ISL admission reservation for
+                    # ASYNC_LOAD_ADMIT_MAX_FAILS consecutive steps is retried
+                    # identically forever (it never parks in
+                    # WAITING_FOR_REMOTE_KVS and holds the head of the waiting
+                    # queue, so running can drain to 0 with generation frozen).
+                    # Abandon the load and recompute the suffix locally, which
+                    # is the intent of kv_load_failure_policy=recompute for
+                    # admission starvation. Nothing was reserved or submitted
+                    # yet (update_state_after_alloc runs only after a successful
+                    # allocation; transfer_jobs stay empty), so dropping the hit
+                    # needs no connector notification: the later
+                    # update_state_after_alloc(..., 0) is a no-op.
+                    if load_kv_async and self._should_degrade_async_load(request_id):
+                        degraded_async_load = True
+                        load_kv_async = False
+                        num_external_computed_tokens = 0
+                        if hit_diverged:
+                            # The external load was the only backing for the
+                            # deeper, diverged local hit; without it a hybrid
+                            # model's recurrent-state resume boundary would be
+                            # invalid. Reconcile to the boundary every group
+                            # agrees on (mirrors the num_external==0 path above).
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                request.shared_prefix_boundary,
+                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                        num_computed_tokens = num_new_local_computed_tokens
 
                     # Skip request with pending mm encoding prefetches
                     if (
@@ -979,7 +1030,15 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # BUG #2: the abandoned async load recomputes locally and is
+                    # preemptible, so it is admitted via ordinary chunked
+                    # prefill (only the first chunk must fit) rather than the
+                    # full-ISL reservation that it could never satisfy. This is
+                    # the actual weakening that breaks the livelock; the full-ISL
+                    # gate is otherwise identical for a dropped-async request.
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl and not degraded_async_load
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -987,11 +1046,23 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
+                    # BUG #2: record an async-load admission failure. Once these
+                    # cross ASYNC_LOAD_ADMIT_MAX_FAILS the degrade branch above
+                    # fires on a later pass. Only genuine async-load reservation
+                    # failures count; a degraded (chunked) request that still
+                    # cannot fit is ordinary backpressure, not a livelock.
+                    if load_kv_async:
+                        self._note_async_load_admit_failure(request_id)
+
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                # BUG #2: admission succeeded (async park, normal, or degraded
+                # local recompute) -> clear the failure count for this request.
+                self._async_load_admit_fails.pop(request_id, None)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2303,6 +2374,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        # BUG #2: drop any async-load admission-failure count so an aborted
+        # request that never admitted does not leak an entry.
+        self._async_load_admit_fails.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2641,6 +2715,21 @@ class Scheduler(SchedulerInterface):
 
         return sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
+        )
+
+    def _note_async_load_admit_failure(self, request_id: str) -> None:
+        """BUG #2: record one more consecutive async-load admission failure."""
+        self._async_load_admit_fails[request_id] = (
+            self._async_load_admit_fails.get(request_id, 0) + 1
+        )
+
+    def _should_degrade_async_load(self, request_id: str) -> bool:
+        """BUG #2: whether an async-load candidate has failed admission enough
+        consecutive steps to abandon the load and recompute the suffix locally.
+        """
+        return (
+            self._async_load_admit_fails.get(request_id, 0)
+            >= ASYNC_LOAD_ADMIT_MAX_FAILS
         )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
