@@ -406,13 +406,22 @@ def precopy_mamba_align_fused_kernel(
 
     src_col = tl.load(src_col_ptr + req_idx)
     dst_col = tl.load(mamba_state_idx_ptr + req_idx)
+    token_bias = tl.load(token_bias_ptr + req_idx)
     # Fresh state, or still writing the same block: kernels locate the initial
     # state in-block via num_accepted (preserved when no boundary is crossed),
     # so there is nothing to copy.
-    if src_col < 0 or src_col == dst_col:
-        return
+    # syv patch (zero-draft-stale-state): V1 (no idx mapping) stages
+    # src_col == dst_col with token_bias > 0 for a request that takes the
+    # non-spec path after a verify step; that in-block shift must run. V2
+    # always stages src_col = state_idx with the accepted bias, so it keeps
+    # the old skip.
+    if HAS_IDX_MAPPING:
+        if src_col < 0 or src_col == dst_col:
+            return
+    else:
+        if src_col < 0 or (src_col == dst_col and token_bias == 0):
+            return
 
-    token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
@@ -1029,6 +1038,39 @@ def cleanup_mamba_state_idx(
         mamba_state_idx.pop(req_id, None)
 
 
+_SYV_SHIFT_COUNT = 0
+
+
+def _syv_count_shift() -> None:
+    """syv patch: log the running count of in-block shifts at powers of two."""
+    global _SYV_SHIFT_COUNT
+    _SYV_SHIFT_COUNT += 1
+    if _SYV_SHIFT_COUNT & (_SYV_SHIFT_COUNT - 1) == 0:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "zero-draft-stale-state: %d in-block mamba state shifts before "
+            "non-spec steps so far",
+            _SYV_SHIFT_COUNT,
+        )
+
+
+def _is_spec_decode_row(
+    scheduler_output: SchedulerOutput, req_id: str, num_scheduled_tokens: int
+) -> bool:
+    """syv patch: True when the mamba kernels treat this request as a spec
+    decode this step (reading the state via num_accepted_tokens).
+
+    Mirrors GPUModelRunner._prepare_inputs, which sets
+    num_decode_draft_tokens >= 0 only for requests with scheduled drafts and
+    num_scheduled_tokens == num_drafts + 1. Every other row takes the non-spec
+    path and reads block column 0.
+    """
+    drafts = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+    num_drafts = len(drafts) if drafts else 0
+    return num_drafts > 0 and num_scheduled_tokens == num_drafts + 1
+
+
 class _FusedPrecopy(NamedTuple):
     """Resolved fused align pre-copy resources (all non-None once resolved)."""
 
@@ -1144,6 +1186,41 @@ def preprocess_mamba(
                     mamba_state_copy_funcs,
                     mamba_group_ids,
                     prev_state_idx,
+                    curr_state_idx,
+                    accept_token_bias,
+                    req_state,
+                    forward_context,
+                )
+            input_batch.num_accepted_tokens_cpu[i] = 1
+        elif (
+            prev_state_idx != -1
+            and num_speculative_blocks > 0
+            and int(input_batch.num_accepted_tokens_cpu[i]) > 1
+            and not _is_spec_decode_row(
+                scheduler_output, req_id, num_scheduled_tokens
+            )
+        ):
+            # syv patch (zero-draft-stale-state): the previous step was a
+            # verify step that accepted drafts, so the running state sits in
+            # column num_accepted - 1 of this block (conv window at token
+            # offset num_accepted - 1). This step schedules no drafts for the
+            # request (grammar-truncated drafts, token budget), so the mamba
+            # kernels take the non-spec path, which ignores num_accepted and
+            # reads column 0 / offset 0: a state that is missing the last
+            # num_accepted - 1 tokens. Shift the state in-block first, exactly
+            # like the block-crossing copy above but with src == dst.
+            accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
+            _syv_count_shift()
+            if fused is not None:
+                fused.src_col.np[i] = curr_state_idx
+                fused.token_bias.np[i] = accept_token_bias
+            else:
+                collect_mamba_copy_meta(
+                    copy_bufs,
+                    kv_cache_config,
+                    mamba_state_copy_funcs,
+                    mamba_group_ids,
+                    curr_state_idx,
                     curr_state_idx,
                     accept_token_bias,
                     req_state,

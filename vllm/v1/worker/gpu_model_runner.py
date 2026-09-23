@@ -1189,6 +1189,15 @@ class GPUModelRunner(
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
 
+    @property
+    def _syv_num_accepted_stash(self) -> dict[str, int]:
+        """syv patch: num_accepted_tokens of hybrid requests that are out of
+        the persistent batch for a step (see _update_states)."""
+        stash = self.__dict__.get("_syv_num_accepted_stash_d")
+        if stash is None:
+            stash = self.__dict__["_syv_num_accepted_stash_d"] = {}
+        return stash
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1245,6 +1254,34 @@ class GPUModelRunner(
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        # syv patch (zero-draft-stale-state, part 2): a running hybrid request
+        # that is skipped for a step (token budget used up by other requests'
+        # prefill chunks) leaves the persistent batch, and add_request() later
+        # resets its num_accepted_tokens to 1. Its mamba/GDN state is still in
+        # block column num_accepted - 1 of the last verify step, so the kernels
+        # would read a stale column. Keep the count across the gap.
+        num_accepted_stash = self._syv_num_accepted_stash
+        preempted_ids = scheduler_output.preempted_req_ids or ()
+        for req_id in itertools.chain(
+            scheduler_output.finished_req_ids, preempted_ids, resumed_req_ids
+        ):
+            num_accepted_stash.pop(req_id, None)
+        if (
+            unscheduled_req_ids
+            and self.speculative_config is not None
+            and self.model_config.is_hybrid
+        ):
+            if self.num_accepted_tokens_event is not None:
+                self.num_accepted_tokens_event.synchronize()
+            for req_id in unscheduled_req_ids:
+                if req_id in preempted_ids or req_id in resumed_req_ids:
+                    continue
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                if idx is None:
+                    continue
+                n = int(self.input_batch.num_accepted_tokens_cpu[idx])
+                if n > 1:
+                    num_accepted_stash[req_id] = n
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1511,6 +1548,19 @@ class GPUModelRunner(
         for request in reqs_to_add:
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
+            # syv patch (zero-draft-stale-state, part 2): restore the count.
+            n = num_accepted_stash.pop(request.req_id, None)
+            if n is not None and request.req_id not in resumed_req_ids:
+                idx = self.input_batch.req_id_to_index[request.req_id]
+                self.input_batch.num_accepted_tokens_cpu[idx] = n
+                c = self.__dict__.get("_syv_restore_count", 0) + 1
+                self.__dict__["_syv_restore_count"] = c
+                if c & (c - 1) == 0:
+                    logger.info(
+                        "zero-draft-stale-state: kept num_accepted_tokens for %d "
+                        "re-added (step-skipped) hybrid requests so far",
+                        c,
+                    )
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
