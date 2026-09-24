@@ -323,6 +323,25 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
     ] == [1, 3]
 
 
+@pytest.mark.parametrize(
+    "extra_config, expected", [({}, 1), ({"mamba_keep_every_n_chunks": 8}, 8)]
+)
+def test_mamba_keep_every_n_chunks_applies_only_to_mamba_groups(
+    extra_config: dict[str, Any], expected: int
+):
+    config = _make_vllm_config(extra_config=extra_config)
+    config.speculative_config = None
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(build_offloading_config(config, kv_cache_config)),
+        config,
+        kv_cache_config,
+    )
+    full_group, mamba_group = scheduler_config.kv_group_configs
+    assert full_group.mamba_keep_every_n_chunks is None  # attention: store all
+    assert mamba_group.mamba_keep_every_n_chunks == expected
+
+
 def test_preserves_data_parallel_index():
     config = _make_vllm_config()
     config.parallel_config.data_parallel_index = 2

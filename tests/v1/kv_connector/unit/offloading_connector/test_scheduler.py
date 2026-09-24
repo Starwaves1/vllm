@@ -21,8 +21,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GroupOffloadConfig,
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    SchedulerOffloadConfig,
+    is_kept_mamba_chunk,
     is_store_reachable_swa_chunk,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -40,6 +43,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
+    get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -209,6 +213,130 @@ def test_is_store_reachable_swa_chunk(
         )
         is expected
     )
+
+
+def _kept_mamba_chunks(num_chunks, num_prompt_tokens, keep_every=8, spb=0):
+    return [
+        c
+        for c in range(num_chunks)
+        if is_kept_mamba_chunk(c, 832, keep_every, num_prompt_tokens, spb)
+    ]
+
+
+def test_is_kept_mamba_chunk():
+    every_8th = list(range(7, 104, 8))
+    # 90k-token prompt: _lookup hits round_down(89999, 832) = 108 chunks, so
+    # its last chunk (107) is kept, as is every 8th chunk.
+    assert _kept_mamba_chunks(108, 90_000) == every_8th + [107]
+    # P a multiple of 832 (10 chunks): the lookup hits 9 chunks (last = 8);
+    # chunk 9 (last prompt chunk) and the output region (10+) are kept too.
+    assert _kept_mamba_chunks(14, 832 * 10) == [7, 8, 9, 10, 11, 12, 13]
+    # One token past a chunk boundary: the lookup hits all 10 chunks.
+    assert _kept_mamba_chunks(12, 832 * 10 + 1) == [7, 9, 10, 11]
+    # P < 832 and P == 832: no hit is possible, every chunk is kept.
+    assert _kept_mamba_chunks(3, 500) == [0, 1, 2]
+    assert _kept_mamba_chunks(3, 832) == [0, 1, 2]
+    # Shared-prefix junction at 3 chunks keeps chunk 2.
+    assert _kept_mamba_chunks(20, 832 * 20, spb=832 * 3) == [2, 7, 15, 18, 19]
+    # 1 keeps every chunk; None (non-Mamba groups) always stores.
+    assert _kept_mamba_chunks(20, 832 * 20, keep_every=1) == list(range(20))
+    assert all(is_kept_mamba_chunk(c, 832, None, 832 * 20, 0) for c in range(20))
+
+
+def _gdn_hybrid_scheduler(keep_every: int) -> OffloadingConnectorScheduler:
+    """Scheduler with the Qwen3.8 layout: 3 GDN groups + 1 attention group,
+    4-token chunks, mamba align mode, sync load."""
+
+    def group(idx: int, is_gdn: bool) -> GroupOffloadConfig:
+        return GroupOffloadConfig(
+            group_idx=idx,
+            tokens_per_block=4,
+            tokens_per_chunk=4,
+            hashes_per_chunk=1,
+            kv_event_group_spec=MagicMock(),
+            sliding_window_size_in_chunks=1 if is_gdn else None,
+            mamba_keep_every_n_chunks=keep_every if is_gdn else None,
+        )
+
+    sched = object.__new__(OffloadingConnectorScheduler)
+    sched.config = SchedulerOffloadConfig(
+        kv_group_configs=tuple(group(i, is_gdn=i < 3) for i in range(4)),
+        blocks_per_chunk=1,
+        num_workers=1,
+        offload_prompt_only=True,
+        sync_load=True,
+    )
+    sched._lookup_groups = (3, 0, 1, 2)
+    sched._sliding_window_groups = (0, 1, 2)
+    sched._mamba_align_size = 4
+    sched._chunks_being_loaded = None
+    sched.manager = MagicMock(spec=OffloadingManager)
+    sched._events_tracker = MagicMock()
+    sched._connector_stats = MagicMock()
+    sched._req_status = {}
+    return sched
+
+
+def _gdn_req_status(sched, num_prompt_tokens: int, hashes: list[int]):
+    req = MagicMock()
+    req.request_id = "r"
+    req.status = RequestStatus.RUNNING
+    req.is_finished.return_value = False
+    req.num_tokens = req.num_prompt_tokens = num_prompt_tokens
+    req.num_computed_tokens = 0
+    req.shared_prefix_boundary = 0
+    req.kv_transfer_params = None
+    state = RequestOffloadState(
+        config=sched.config,
+        req=req,
+        req_context=ReqContext(req_id="r"),
+        offloading_context=RequestOffloadingContext(policy=OffloadPolicy.BLOCK_LEVEL),
+    )
+    for idx, gs in enumerate(state.group_states):
+        gs.offload_keys = [make_offload_key(str(h).encode(), idx) for h in hashes]
+        gs.block_ids = [100 * idx + h + 1 for h in hashes]
+    return state
+
+
+def test_gdn_snapshots_pruned_on_store_and_lookup_falls_back():
+    """Store a 10-chunk prompt with 3 GDN groups + attention, then look it up
+    through _lookup: GDN keeps only chunks 3, 7 (every 4th) and 8, 9 (prompt
+    tail); attention keeps all; hits end at the prompt-final keeper and fall
+    back to the previous keeper when it is missing."""
+    sched = _gdn_hybrid_scheduler(keep_every=4)
+    sched._req_status["r"] = _gdn_req_status(sched, 40, list(range(10)))
+    sched.manager.prepare_store.return_value = None  # just capture the keys
+    sched._build_store_jobs(
+        SimpleNamespace(num_scheduled_tokens={"r": 40}, finished_req_ids=set())
+    )
+    (stored_keys, _), _ = sched.manager.prepare_store.call_args
+
+    def chunks(group_idx):
+        return sorted(
+            int(get_offload_block_hash(k))
+            for k in stored_keys
+            if get_offload_group_idx(k) == group_idx
+        )
+
+    assert chunks(3) == list(range(10))  # attention: every chunk
+    for gdn in range(3):
+        assert chunks(gdn) == [3, 7, 8, 9]
+
+    stored_keys = set(stored_keys)
+    sched.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+
+    def lookup(num_tokens, hashes):
+        return sched._lookup(_gdn_req_status(sched, num_tokens, hashes))
+
+    # Same prompt: round_down(39, 4) = 36 tokens, GDN at chunk 8 (a keeper).
+    assert lookup(40, list(range(10))) == 36
+    # Diverging after 6 chunks: attention hits 6, GDN falls back to chunk 3.
+    assert lookup(40, list(range(6)) + [60, 61, 62, 63]) == 16
+    # Prompt-final keeper missing in one GDN group: fall back to chunk 7.
+    stored_keys.discard(make_offload_key(b"8", 1))
+    assert lookup(40, list(range(10))) == 32
 
 
 def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):

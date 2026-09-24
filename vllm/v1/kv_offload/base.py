@@ -607,6 +607,15 @@ class OffloadingSpec(ABC):
         # copy is orders of magnitude cheaper than recomputing the prefix.
         self.sync_load: bool = bool(self.extra_config.get("sync_load", False))
 
+        # Mamba (e.g. GDN) state is stored for every N-th chunk plus the
+        # chunks a hit is known to end on (see is_kept_mamba_chunk); a hit
+        # falls back to the previous kept chunk. 1 (default) stores every chunk.
+        self.mamba_keep_every_n_chunks: int = int(
+            self.extra_config.get("mamba_keep_every_n_chunks", 1)
+        )
+        if self.mamba_keep_every_n_chunks < 1:
+            raise ValueError("mamba_keep_every_n_chunks must be >= 1")
+
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
