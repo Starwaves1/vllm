@@ -7,7 +7,8 @@ tier are not cascaded; once per scheduler step, while the CPU tier is filled to
 the high watermark, the coldest blocks the tier lacks are written (with the
 earlier chunks of their prefix and their KV-cache-group siblings) until at most
 the low watermark of the CPU tier is unwritten. Reads first: one chunk per job,
-one job in flight, none while a promotion is in flight.
+at most _WRITEBACK_INFLIGHT_BYTES in flight, none while a promotion is in
+flight. Most tests set that budget to one block (one job in flight).
 """
 
 import threading
@@ -18,6 +19,7 @@ import pytest
 import torch
 
 import vllm.v1.kv_offload.tiering.fs.manager as fsm
+import vllm.v1.kv_offload.tiering.manager as tm
 from tests.v1.kv_offload.tiering.test_fs_tier import (
     _BLOCK_ELEMENTS,
     _make_offloading_spec,
@@ -75,6 +77,7 @@ class _Env:
         high=0.5,
         low=0.75,
         cache_policy="lru",
+        inflight_blocks=1,
         **tier_kw,
     ):
         self.tensor = _page_aligned_zero_tensor(n_blocks, _BLOCK_ELEMENTS)
@@ -98,6 +101,8 @@ class _Env:
             primary_tier=self.primary, secondary_tiers=[self.tier]
         )
         self.wb = self.manager._writeback.get(self.tier)
+        if self.wb is not None and inflight_blocks is not None:
+            self.manager._writeback_max_inflight_blocks = inflight_blocks
         self.ctx = ReqContext(req_id="r0")
         self.manager.on_new_request(self.ctx)
         self.patterns: dict[OffloadKey, float] = {}
@@ -167,7 +172,7 @@ def _blocking_store(monkeypatch, name="batch_store_block"):
 
 def _flush(e):
     """Step until the flusher idles; return each write-back job's keys. At
-    most one job is ever in flight."""
+    most one job is ever in flight (the default one-block budget)."""
     written = []
     e.step()
     while e.jobs():
@@ -591,7 +596,7 @@ def test_flush_jobs_are_one_chunk_one_at_a_time(env):
 def test_no_flush_while_promotion_in_flight(env, monkeypatch):
     """The flusher submits nothing while a load from the tier is in flight,
     and resumes once it is done."""
-    e = env(n_blocks=8, high=0.5, low=0.0)
+    e = env(n_blocks=8, high=0.5, low=0.0, inflight_blocks=4)
     e.tier.submit_store(make_job(900, [k(100)], [7]))
     drain(e.tier)  # k100: on disk only
     gate = _blocking_store(monkeypatch, "batch_load_block")
@@ -605,7 +610,7 @@ def test_no_flush_while_promotion_in_flight(env, monkeypatch):
         assert not e.wb.flushing
         gate.set()
         e.settle()  # load done; the same step's flusher resumes
-        assert [list(j.keys) for j in e.jobs()] == [[k(0)]]
+        assert [list(j.keys) for j in e.jobs()] == [[k(i)] for i in range(4)]
         assert e.manager.lookup(k(100), e.ctx) is LookupResult.HIT
     finally:
         gate.set()
@@ -636,3 +641,25 @@ def test_prefix_walk_by_chunk_with_pruned_gdn_blocks(env):
         e.settle()
     assert order == [k(c)[:-4] for c in range(n)]
     assert not e.wb.dirty
+
+
+def test_flush_budget_keeps_several_chunk_jobs_in_flight(env):
+    """With no promotion in flight, one step submits one-chunk jobs in prefix
+    order until the in-flight budget is used, so the disk isn't left idle
+    between scheduler steps."""
+    e = env(n_blocks=200, high=0.5, low=0.0, inflight_blocks=None)
+    assert (
+        e.manager._writeback_max_inflight_blocks == tm._WRITEBACK_INFLIGHT_BYTES // _BS
+    )
+    e.manager._writeback_max_inflight_blocks = 12  # 3 chunks of 4 groups
+    groups = [[k(c, g) for c in range(30)] for g in range(4)]
+    e.store([key for group in groups for key in group])  # 120 blocks
+    for group in groups:  # LRU: the tail chunks are coldest
+        e.manager.touch(group, e.ctx)
+    e.step()
+    chunk = [[k(c, g) for g in range(4)] for c in range(30)]
+    assert [sorted(j.keys) for j in e.jobs()] == chunk[:3]
+    e.step()
+    assert len(e.jobs()) == 3  # budget used: nothing more until one finishes
+    e.settle()
+    assert [sorted(j.keys) for j in e.jobs()] == chunk[3:6]
