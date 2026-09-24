@@ -102,6 +102,8 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # Mamba groups only: see is_kept_mamba_chunk. None stores every chunk.
+    mamba_keep_every_n_chunks: int | None = None
 
 
 def get_sliding_window_size_in_chunks(
@@ -137,6 +139,32 @@ def is_store_reachable_swa_chunk(
     )
     reachable_tail = sliding_window_chunks + int(is_eagle_group)
     return position_in_segment >= actual_segment_length - reachable_tail
+
+
+def is_kept_mamba_chunk(
+    chunk_idx: int,
+    tokens_per_chunk: int,
+    keep_every_n_chunks: int | None,
+    num_prompt_tokens: int,
+    shared_prefix_boundary: int,
+) -> bool:
+    """Return whether a Mamba group's chunk state is worth storing.
+
+    A hit needs attention KV for every chunk but Mamba state only at its last
+    chunk, so intermediate states only serve as fallback hit points. Keep every
+    chunk from the one ending the prompt's own lookup (round_down(P - 1) in
+    _lookup) onward, which covers the prompt tail, decode output and preemption
+    resume, plus the shared-prefix junction and every N-th chunk. This is the
+    rule MambaManager.reachable_block_mask applies to the GPU prefix cache.
+    A skipped state can only shorten a hit to the previous kept chunk.
+    """
+    if keep_every_n_chunks is None:
+        return True
+    return (
+        (chunk_idx + 1) % keep_every_n_chunks == 0
+        or chunk_idx >= (num_prompt_tokens - 1) // tokens_per_chunk - 1
+        or chunk_idx == shared_prefix_boundary // tokens_per_chunk - 1
+    )
 
 
 def resolve_mamba_align_size(
@@ -278,6 +306,14 @@ class SchedulerOffloadConfig(NamedTuple):
                         kv_cache_config.kv_cache_groups[idx]
                     ),
                     is_eagle_group=idx in eagle_groups,
+                    mamba_keep_every_n_chunks=(
+                        spec.mamba_keep_every_n_chunks
+                        if isinstance(
+                            kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
+                            MambaSpec,
+                        )
+                        else None
+                    ),
                 )
                 for idx, tokens_per_block in enumerate(spec.tokens_per_block)
             ),
@@ -1167,6 +1203,14 @@ class OffloadingConnectorScheduler:
                         group_config.alignment_chunk_count,
                         group_config.sliding_window_size_in_chunks,
                         group_config.is_eagle_group,
+                    ):
+                        continue
+                    if not is_kept_mamba_chunk(
+                        abs_chunk_idx,
+                        group_config.tokens_per_chunk,
+                        group_config.mamba_keep_every_n_chunks,
+                        req.num_prompt_tokens,
+                        req.shared_prefix_boundary,
                     ):
                         continue
                     new_offload_keys.append(offload_key)
