@@ -75,11 +75,6 @@ class PendingPromotion:
     block_ids: list[int] = field(default_factory=list)
 
 
-# Max blocks per write-back store job. A job's blocks stay pinned until its
-# last block is written, so small jobs release CPU slots sooner.
-_WRITEBACK_JOB_BLOCKS = 16
-
-
 @dataclass
 class _WritebackState:
     """Write-back bookkeeping for one secondary tier (scheduler thread)."""
@@ -893,44 +888,30 @@ class TieringOffloadingManager(OffloadingManager):
         """Once per scheduler step. While the primary tier holds at least
         ``high_blocks`` blocks, keep its cold end on ``wb.tier``: write the
         unwritten blocks among the coldest ``num_blocks - low_blocks``
-        evictable blocks (the next eviction victims), until the tier declines
+        evictable blocks (the next eviction victims), unless the tier declines
         (store backlog cap, breaker). Blocks elsewhere, e.g. just promoted
         from the tier, don't count: only the cold end is about to be evicted.
         Eviction itself never waits: a block evicted before its write started
-        is lost to the tier (counted in writeback_lost_blocks)."""
+        is lost to the tier (counted in writeback_lost_blocks).
+
+        Reads first: one job (one chunk) at a time, and none while a
+        promotion is in flight, so a promotion waits behind at most one
+        chunk's writes."""
         primary = self.primary_tier
-        if primary.num_used_blocks() < wb.high_blocks:
+        if wb.flushing or primary.num_used_blocks() < wb.high_blocks:
+            return
+        if any(job.is_promotion for job in self._transfer_jobs.values()):
             return
         window = primary.num_blocks - wb.low_blocks
-        # Write-back never pins more than the cold window.
-        budget = window - len(wb.flushing)
-        # Plan first: pinning below changes the evictable set being iterated.
-        # A unit is taken oldest chunk first and cut off at the budget
-        # (overshooting by at most one chunk's group siblings); the rest of a
-        # long prefix follows on later steps.
-        chunks: list[list[OffloadKey]] = []
         taken: set[OffloadKey] = set()
         for key in itertools.islice(primary.iter_evictable(), window):
-            if budget <= 0:
-                break
-            if key not in wb.dirty or key in taken or key in wb.flushing:
+            if key not in wb.dirty or key in taken:
                 continue
-            for chunk in self._plan_writeback_unit(wb, key, taken):
-                if budget <= 0:
-                    break
-                chunks.append(chunk)
-                budget -= len(chunk)
-        # Submit oldest prefix chunks first, in jobs of about
-        # _WRITEBACK_JOB_BLOCKS; a chunk's group siblings share a job.
-        batch: list[OffloadKey] = []
-        for chunk in chunks:
-            batch.extend(chunk)
-            if len(batch) >= _WRITEBACK_JOB_BLOCKS:
-                if not self._submit_writeback(wb, batch):
-                    return
-                batch = []
-        if batch:
-            self._submit_writeback(wb, batch)
+            unit = self._plan_writeback_unit(wb, key, taken)
+            if unit:
+                # The oldest unwritten chunk of the prefix; the rest follows.
+                self._submit_writeback(wb, unit[0])
+                return
 
     def _submit_writeback(self, wb: _WritebackState, keys: list[OffloadKey]) -> bool:
         job = self._submit_store_to_tier(wb.tier, keys, self._writeback_ctx)
