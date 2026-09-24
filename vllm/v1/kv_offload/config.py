@@ -14,6 +14,9 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # Mamba-style state group (e.g. GDN): a block is a state snapshot, used
+    # only when a prefix hit ends at its chunk.
+    is_mamba: bool = False
 
 
 @dataclass(frozen=True)

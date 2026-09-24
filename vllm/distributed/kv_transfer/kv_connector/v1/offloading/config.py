@@ -8,6 +8,7 @@ from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    MambaSpec,
     MLAAttentionSpec,
 )
 from vllm.v1.kv_offload.config import (
@@ -51,6 +52,7 @@ def build_offloading_config(
                 )
             ),
             layer_names=tuple(group.layer_names),
+            is_mamba=isinstance(group.kv_cache_spec, MambaSpec),
         )
         for group in kv_cache_config.kv_cache_groups
     )

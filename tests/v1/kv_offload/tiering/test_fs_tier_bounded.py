@@ -19,6 +19,7 @@ on top): the in-flight store cap (``max_inflight_store_bytes``) and the circuit
 breaker with probe recovery. Red on a venv with only fs-tier-0271.patch.
 """
 
+import dataclasses
 import errno
 import os
 import threading
@@ -50,6 +51,7 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.config import OffloadingGroupConfig
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
@@ -366,6 +368,90 @@ def test_factory_and_metric_definitions(tmp_path):
     assert "vllm:kv_offload_fs_load_bytes" in defs
     with pytest.raises(ValueError):
         _tier(tmp_path, max_bytes=-1)
+
+
+def _hybrid_tier(tmp_path, n_files):
+    """Bounded fs tier of a Qwen3.8-like model: g0 attention, g1-g3 GDN."""
+    spec = _make_offloading_spec()
+    spec.config = dataclasses.replace(
+        spec.config,
+        groups=(OffloadingGroupConfig(16, ("attn",)),)
+        + tuple(
+            OffloadingGroupConfig(16, (f"gdn{g}",), is_mamba=True) for g in (1, 2, 3)
+        ),
+    )
+    tensor = _page_aligned_zero_tensor(8, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=spec,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        max_bytes=n_files * _BS,
+    )
+    return tier
+
+
+def _ck(chunk, group):
+    return make_offload_key(b"chunk%d" % chunk, group)
+
+
+def _on_disk(tier, keys):
+    return [os.path.exists(tier.file_mapper.get_file_name(k)) for k in keys]
+
+
+def _assert_accounting(tier):
+    assert tier._cache_bytes == sum(tier._entries.values())
+    assert tier._reserved_bytes == 0
+    for k in tier._entries:
+        assert os.path.exists(tier.file_mapper.get_file_name(k))
+
+
+@pytest.mark.parametrize("victim_group", [0, 1])
+def test_evict_takes_chunk_gdn_siblings(tmp_path, victim_group):
+    """A hit ending at a chunk needs all its groups' files: when one of them
+    is evicted, the chunk's GDN files go too (the attention file stays, it
+    serves longer prefixes); else lone GDN files fill the tier unused."""
+    tier = _hybrid_tier(tmp_path, n_files=8)
+    try:
+        c0, c1 = ([_ck(c, g) for g in range(4)] for c in (0, 1))
+        tier.submit_store(make_job(1, c0, [0, 1, 2, 3]))
+        drain(tier)
+        tier.submit_store(make_job(2, c1, [4, 5, 6, 7]))
+        drain(tier)
+        # the victim is the LRU file of c0; its other files are more recent
+        tier.touch([k for g, k in enumerate(c0) if g != victim_group], _CTX)
+        tier.submit_store(make_job(3, [_ck(2, 0)], [0]))  # one file over
+        drain(tier)
+        kept = [g == 0 and victim_group != 0 for g in range(4)]
+        assert _on_disk(tier, c0) == kept
+        assert _on_disk(tier, c1) == [True] * 4
+        freed = (4 - sum(kept)) * _BS
+        assert tier.get_stats().reduce()["vllm:kv_offload_fs_evicted_bytes"] == freed
+        assert tier._cache_bytes == 9 * _BS - freed
+        _assert_accounting(tier)
+    finally:
+        tier.shutdown()
+
+
+def test_evict_keeps_pinned_gdn_sibling(tmp_path):
+    tier = _hybrid_tier(tmp_path, n_files=4)
+    try:
+        c0 = [_ck(0, g) for g in range(4)]
+        tier.submit_store(make_job(1, c0, [0, 1, 2, 3]))
+        drain(tier)
+        # an in-flight promotion pins c0g2 until its result is collected
+        tier.submit_load(make_job(2, [c0[2]], [4], is_promotion=True))
+        tier.submit_store(make_job(3, [_ck(1, 0)], [5]))
+        tier.drain_jobs()
+        assert {r.job_id: r.success for r in tier.get_finished_jobs()} == {
+            2: True,
+            3: True,
+        }
+        assert _on_disk(tier, c0) == [False, False, True, False]
+        assert tier._cache_bytes == 2 * _BS
+        _assert_accounting(tier)
+    finally:
+        tier.shutdown()
 
 
 # ---------------------------------------------------------------------------
