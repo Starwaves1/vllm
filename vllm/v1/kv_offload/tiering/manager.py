@@ -312,11 +312,13 @@ class TieringOffloadingManager(OffloadingManager):
                 low_blocks=int(n * tier.writeback_low_watermark),
             )
         self._writeback_jobs: dict[JobId, _WritebackState] = {}
-        # Prefix links learned from touch(): key -> key of the preceding chunk
-        # of the same KV cache group, for keys in the primary tier. A block
-        # hash chains its parent's, so a link never changes. Pruned on primary
-        # eviction; reset if it ever outgrows the primary (failed stores).
-        self._writeback_parent: dict[OffloadKey, OffloadKey] = {}
+        # Prefix links learned from touch(): block hash -> block hash of the
+        # preceding chunk, for chunks in the primary tier. Per chunk, not per
+        # key, so the walk follows the chunk chain whichever groups a chunk
+        # has blocks for. A block hash chains its parent's, so a link never
+        # changes. Pruned when a chunk's last block leaves the primary tier;
+        # reset if it ever outgrows the primary (failed stores).
+        self._writeback_parent: dict[bytes, bytes] = {}
         # Group-index suffixes of the keys seen (in order), to find a chunk's
         # siblings.
         self._writeback_groups: dict[bytes, None] = {}
@@ -814,8 +816,14 @@ class TieringOffloadingManager(OffloadingManager):
                     dirty.discard(key)
                     wb.n_lost += 1
         parent = self._writeback_parent
+        get_block = self.primary_tier.get_block
         for key in keys:
-            parent.pop(key, None)
+            block_hash = key[:-4]
+            if block_hash in parent and not any(
+                get_block(OffloadKey(block_hash + group)) is not None
+                for group in self._writeback_groups
+            ):
+                del parent[block_hash]
 
     def _note_writeback_use(
         self, keys: Collection[OffloadKey], learn_prefix: bool = False
@@ -829,13 +837,14 @@ class TieringOffloadingManager(OffloadingManager):
             get_block = self.primary_tier.get_block
             prev = None
             for key in keys:
+                block_hash = key[:-4]
                 if (
                     prev is not None
-                    and key not in parent
+                    and block_hash not in parent
                     and get_block(key) is not None
                 ):
-                    parent[key] = prev
-                prev = key
+                    parent[block_hash] = prev
+                prev = block_hash
             if len(parent) > 2 * self.primary_tier.num_blocks:
                 parent.clear()  # links are re-learned on the next touches
         for wb in flushing:
@@ -856,32 +865,31 @@ class TieringOffloadingManager(OffloadingManager):
     def _plan_writeback_unit(
         self, wb: _WritebackState, key: OffloadKey, taken: set[OffloadKey]
     ) -> list[list[OffloadKey]]:
-        """``key`` plus the unwritten earlier chunks of its prefix (oldest
-        first), each with its unwritten siblings of the other KV cache groups.
+        """``key``'s chunk plus the unwritten earlier chunks of its prefix
+        (oldest first). A chunk is its unwritten blocks of every KV cache
+        group; not every chunk has blocks of every group.
 
         A secondary-tier hit needs every chunk before it (prefix lookup stops
         at the first miss) and, for a hybrid model, the blocks of all groups
-        at the hit boundary. The prefix walk stops at the first chunk that is
-        already written, being written, or not in the primary tier."""
+        at the hit boundary. The prefix walk stops at the first chunk with
+        nothing to write (already written, being written, or not in the
+        primary tier)."""
         parent = self._writeback_parent
-        chain: list[OffloadKey] = []
-        k: OffloadKey | None = key
-        while k is not None and self._flushable(wb, k, taken):
-            chain.append(k)
-            taken.add(k)
-            k = parent.get(k)
-        chain.reverse()
-        unit: list[list[OffloadKey]] = []
         groups = self._writeback_groups
-        for k in chain:
-            chunk = [k]
-            block_hash = k[:-4]
-            for group in groups:
-                sibling = OffloadKey(block_hash + group)
-                if sibling != k and self._flushable(wb, sibling, taken):
-                    chunk.append(sibling)
-                    taken.add(sibling)
+        unit: list[list[OffloadKey]] = []
+        block_hash: bytes | None = key[:-4]
+        while block_hash is not None:
+            chunk = [
+                k
+                for group in groups
+                if self._flushable(wb, k := OffloadKey(block_hash + group), taken)
+            ]
+            if not chunk:
+                break
+            taken.update(chunk)
             unit.append(chunk)
+            block_hash = parent.get(block_hash)
+        unit.reverse()
         return unit
 
     def _writeback_step(self, wb: _WritebackState) -> None:

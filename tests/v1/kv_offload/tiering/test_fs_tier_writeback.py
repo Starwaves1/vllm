@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
     ScheduleEndContext,
+    get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy
@@ -520,7 +521,7 @@ def test_request_touch_learns_links_only_for_cpu_blocks(env):
     e = env()
     e.store([k(0), k(1)])
     e.manager.touch([k(0), k(1), k(2)], e.ctx)  # k2 only on the GPU
-    assert e.manager._writeback_parent == {k(1): k(0)}
+    assert e.manager._writeback_parent == {k(1)[:-4]: k(0)[:-4]}
     evicted = e.store([k(i) for i in range(2, 22)]).evicted_keys
     assert sorted(evicted) == [k(0), k(1)]
     assert e.manager._writeback_parent == {}  # pruned on eviction
@@ -608,3 +609,30 @@ def test_no_flush_while_promotion_in_flight(env, monkeypatch):
         assert e.manager.lookup(k(100), e.ctx) is LookupResult.HIT
     finally:
         gate.set()
+
+
+def test_prefix_walk_by_chunk_with_pruned_gdn_blocks(env):
+    """GDN blocks stored only at some chunks (every 8th and the last), attention
+    at every chunk. GDN keys are touched before attention, so they are the
+    coldest; the walk from one must still go back along the chunk chain and
+    write chunk 0 first, then the prefix in order."""
+    n = 40
+    keepers = set(range(7, n, 8)) | {n - 1}
+    e = env(n_blocks=100, high=0.5, low=0.0)
+    attention = [k(c, 0) for c in range(n)]
+    gdn = [[k(c, g) for c in range(n)] for g in (1, 2, 3)]
+    e.store(attention + [group[c] for group in gdn for c in sorted(keepers)])
+    for group in gdn:  # the connector touches every group's full key list
+        e.manager.touch(group, e.ctx)
+    e.manager.touch(attention, e.ctx)
+    assert get_offload_group_idx(next(iter(e.policy.evictable_blocks))) != 0
+    order = []
+    for _ in range(n + 5):
+        e.step()
+        for job in e.jobs():
+            chunks = {bytes(key[:-4]) for key in job.keys}
+            assert len(chunks) == 1  # one whole chunk per job
+            order.append(chunks.pop())
+        e.settle()
+    assert order == [k(c)[:-4] for c in range(n)]
+    assert not e.wb.dirty
