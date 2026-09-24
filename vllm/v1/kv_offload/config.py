@@ -16,6 +16,9 @@ class OffloadingGroupConfig:
     layer_names: tuple[str, ...]
     # Original KVCacheConfig group index.
     group_id: int
+    # Mamba-style state group (e.g. GDN): a block is a state snapshot, used
+    # only when a prefix hit ends at its chunk.
+    is_mamba: bool = False
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,8 @@
 tier are not cascaded; once per scheduler step, while the CPU tier is filled to
 the high watermark, the coldest chunks the tier lacks are written (with the
 earlier chunks of their prefix and their KV-cache-group siblings) until at most
-the low watermark of the CPU tier is unwritten.
+the low watermark of the CPU tier is unwritten. Reads first: one chunk per job,
+one job in flight, none while a promotion is in flight.
 """
 
 import threading
@@ -17,7 +18,6 @@ import pytest
 import torch
 
 import vllm.v1.kv_offload.tiering.fs.manager as fsm
-import vllm.v1.kv_offload.tiering.manager as tm
 from tests.v1.kv_offload.tiering.test_fs_tier import (
     _BLOCK_ELEMENTS,
     _make_offloading_spec,
@@ -155,16 +155,28 @@ def env(tmp_path):
         e.close()
 
 
-def _blocking_store(monkeypatch):
-    real = fsm.batch_store_block
+def _blocking_store(monkeypatch, name="batch_store_block"):
+    real = getattr(fsm, name)
     gate = threading.Event()
 
-    def wait_then_store(*args, **kwargs):
+    def wait_then_run(*args, **kwargs):
         assert gate.wait(10)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(fsm, "batch_store_block", wait_then_store)
+    monkeypatch.setattr(fsm, name, wait_then_run)
     return gate
+
+
+def _flush(e):
+    """Step until the flusher idles; return each write-back job's keys. At
+    most one job is ever in flight."""
+    written = []
+    e.step()
+    while e.jobs():
+        (job,) = e.jobs()
+        written.append(list(job.keys))
+        e.settle()  # job done; the same step's flusher submits the next one
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +258,12 @@ def test_flush_starts_at_high_and_stops_at_low(env):
     assert not e.jobs()  # nothing before the step's flusher runs
     e.step()
     cold = [k(i) for i in range(5)]
-    assert [list(j.keys) for j in e.jobs()] == [cold]
+    assert [list(j.keys) for j in e.jobs()] == [[k(0)]]  # one chunk per job
     assert e.jobs()[0].req_context.req_id == WRITEBACK_REQ_ID
-    assert e.pinned([k(i) for i in range(10)]) == cold  # ref+1 for the write
+    assert e.pinned([k(i) for i in range(10)]) == [k(0)]  # ref+1 for the write
     e.step()
-    assert len(e.jobs()) == 1  # 5 unwritten left, none in flight: at low
-    e.settle()
+    assert len(e.jobs()) == 1  # one job in flight at a time
+    assert _flush(e) == [[key] for key in cold]  # 5 unwritten left: at low
     assert not e.jobs() and not e.pinned(cold)
     assert all(e.tier.is_stored(key) for key in cold)
     assert e.wb.dirty == {k(i) for i in range(5, 10)}
@@ -266,18 +278,16 @@ def test_flush_starts_at_high_and_stops_at_low(env):
 def test_flushed_blocks_evicted_first_and_not_reflushed(env):
     e = env()  # 20 blocks, high 10, cold window 5
     e.store([k(i) for i in range(10)])
-    e.step()
-    e.settle()
+    _flush(e)
     # written blocks went back to the LRU end: they are the next victims
-    assert e.lru_order()[:5] == [k(i) for i in range(5)]
+    assert sorted(e.lru_order()[:5]) == [k(i) for i in range(5)]
     e.store([k(i) for i in range(10, 20)])  # CPU tier now full
     e.step()
     assert not e.jobs()  # the cold window is clean: nothing to write
     evicted = e.store([k(i) for i in range(20, 25)]).evicted_keys
-    assert evicted == [k(i) for i in range(5)]  # all already on disk
-    e.step()  # the next 5 victims are written
-    assert [list(j.keys) for j in e.jobs()] == [[k(i) for i in range(5, 10)]]
-    e.settle()
+    assert sorted(evicted) == [k(i) for i in range(5)]  # all already on disk
+    # the next 5 victims are written
+    assert _flush(e) == [[k(i)] for i in range(5, 10)]
     stats = e.stats()
     assert _M.WRITEBACK_LOST not in stats
     assert stats[_M.WRITEBACK_FLUSHED] == 10
@@ -309,12 +319,9 @@ def test_promoted_clean_blocks_do_not_starve_the_cold_end(env):
     e.manager.on_request_finished(reader)
     assert e.lru_order()[-5:] == promoted[::-1]
     assert len(e.wb.dirty) == 15 and e.primary.num_used_chunks() == 20
-    e.step()
-    written = [key for j in e.jobs() for key in j.keys]
-    assert written == [k(i) for i in range(5)]
-    e.settle()
+    assert _flush(e) == [[k(i)] for i in range(5)]
     evicted = e.store([k(i) for i in range(20, 25)]).evicted_keys
-    assert evicted == [k(i) for i in range(5)]
+    assert sorted(evicted) == [k(i) for i in range(5)]
     assert _M.WRITEBACK_LOST not in e.stats()
 
 
@@ -332,25 +339,20 @@ def test_evicting_unwritten_block_counts_lost(env):
 
 
 def test_backlog_cap_stops_flushing_without_pinning(env, monkeypatch):
-    monkeypatch.setattr(tm, "_WRITEBACK_JOB_CHUNKS", 2)
-    e = env(max_inflight_store_bytes=2 * _BS)  # 20 blocks, high 10, cold window 5
+    e = env(max_inflight_store_bytes=_BS)  # 20 blocks, high 10, cold window 5
     gate = _blocking_store(monkeypatch)
     try:
         e.store([k(i) for i in range(10)])
+        # another store fills the tier's write backlog
+        e.tier.submit_store(make_job(900, [k(100)], [19]))
         e.step()
-        # first job (2 blocks) fills the backlog; the next one is declined
-        assert [list(j.keys) for j in e.jobs()] == [[k(0), k(1)]]
-        assert e.pinned([k(i) for i in range(10)]) == [k(0), k(1)]
+        assert not e.jobs()  # declined
+        assert not e.pinned([k(i) for i in range(10)])
         assert not e.tier._dropping_reqs  # not sticky
-        e.step()
-        assert len(e.jobs()) == 1
         gate.set()
-        e.settle()  # job done; the same step's flusher submits the next one
-        assert [list(j.keys) for j in e.jobs()] == [[k(2), k(3)]]
-        e.settle()
-        assert [list(j.keys) for j in e.jobs()] == [[k(4)]]
-        e.settle()
-        assert not e.jobs() and len(e.wb.dirty) == 5
+        drain(e.tier)
+        assert _flush(e) == [[k(i)] for i in range(5)]
+        assert len(e.wb.dirty) == 5
         stats = e.stats()
         assert stats[_M.WRITEBACK_FLUSHED] == 5
         assert "vllm:kv_offload_fs_stores_dropped" not in stats
@@ -379,14 +381,14 @@ def test_failed_write_keeps_blocks_dirty(env, monkeypatch):
     monkeypatch.setattr(fsm, "batch_store_block", fail)
     e.store([k(i) for i in range(10)])
     e.step()
-    assert len(e.jobs()) == 1
+    assert [list(j.keys) for j in e.jobs()] == [[k(0)]]
     e.tier.drain_jobs()
     monkeypatch.undo()
     e.step()  # failure consumed: unpinned, still dirty, offered again
     assert len(e.wb.dirty) == 10 and e.wb.n_flushed == 0
-    assert [list(j.keys) for j in e.jobs()] == [[k(i) for i in range(5)]]
+    assert [list(j.keys) for j in e.jobs()] == [[k(0)]]
     assert not any(e.tier.is_stored(k(i)) for i in range(10))
-    e.settle()
+    _flush(e)
     assert len(e.wb.dirty) == 5
 
 
@@ -431,32 +433,30 @@ def test_prefix_flushed_with_cold_tail_oldest_first(env):
     # the tail as coldest: c5 c4 c3 c2 c1 c0
     e.manager.touch(chain, e.ctx)
     assert e.lru_order() == chain[::-1]
-    e.step()
-    # budget 3; the cold pick is c5, but c5 on disk is useless without
-    # c0..c4 (prefix lookup stops at the first miss): the prefix goes oldest
-    # first and the step stops at its budget, the rest follows later
-    assert [list(j.keys) for j in e.jobs()] == [chain[:3]]
-    e.settle()
+    # the cold pick is c5, but c5 on disk is useless without c0..c4 (prefix
+    # lookup stops at the first miss): the prefix goes oldest first, one
+    # chunk per job, until the cold window of 3 is written
+    assert _flush(e) == [[key] for key in chain[:3]]
     # every written block no request used meanwhile goes back to the LRU end,
     # prefix chunks included
-    assert e.lru_order() == chain[:3] + chain[3:][::-1]
+    assert e.lru_order() == chain[:3][::-1] + chain[3:][::-1]
 
 
-def test_one_step_pins_no_more_than_needed(env):
-    """A long dirty prefix behind one cold block must not be pinned in one
-    step: the flusher stops at its budget (plus at most one chunk's group
-    siblings), so the CPU tier keeps enough evictable blocks to store."""
+def test_one_step_pins_one_chunk(env):
+    """A long dirty prefix behind one cold block is written one chunk (all
+    its groups) per job, oldest first, one job in flight."""
     e = env(n_blocks=200, high=0.75, low=0.8)  # high 150, cold window 40
     groups = [[k(c, g) for c in range(40)] for g in range(4)]
     e.store([key for group in groups for key in group])  # 160 blocks
     for group in groups:
         e.manager.touch(group, e.ctx)
-    e.step()  # budget: the 40-block cold window
-    pinned = [key for j in e.jobs() for key in j.keys]
-    assert 40 <= len(pinned) <= 40 + 3
-    assert sorted(pinned) == sorted(k(c, g) for c in range(10) for g in range(4))
-    # 40 free + 120 evictable: a 80-block store still fits
-    assert e.manager.prepare_store([k(1000 + i) for i in range(80)], e.ctx)
+    e.step()
+    e.step()
+    assert [sorted(j.keys) for j in e.jobs()] == [[k(0, g) for g in range(4)]]
+    written = _flush(e)
+    assert [sorted(keys) for keys in written[:3]] == [
+        [k(c, g) for g in range(4)] for c in range(3)
+    ]
 
 
 def test_prefix_walk_stops_at_block_already_on_disk(env):
@@ -467,8 +467,7 @@ def test_prefix_walk_stops_at_block_already_on_disk(env):
     e.store(chain)
     assert k(2) not in e.wb.dirty  # is_stored: nothing to write
     e.manager.touch(chain, e.ctx)
-    e.step()
-    assert [list(j.keys) for j in e.jobs()] == [[k(3), k(4), k(5)]]
+    assert _flush(e) == [[k(3)], [k(4)], [k(5)]]
 
 
 def test_block_used_while_flushing_is_not_demoted(env, monkeypatch):
@@ -479,9 +478,9 @@ def test_block_used_while_flushing_is_not_demoted(env, monkeypatch):
         e.step()
         e.manager.touch([k(0)], e.ctx)  # a request hits k0 mid-write
         gate.set()
-        e.settle()
+        assert _flush(e)[0] == [k(0)]
         order = e.lru_order()
-        assert order[:4] == [k(i) for i in range(1, 5)]
+        assert sorted(order[:5]) == [k(i) for i in range(1, 6)]
         assert order[-1] == k(0)
     finally:
         gate.set()
@@ -490,20 +489,19 @@ def test_block_used_while_flushing_is_not_demoted(env, monkeypatch):
 def test_flushed_block_promoted_back_and_hits(env):
     e = env(n_blocks=8, high=0.5, low=0.0)
     e.store([k(i) for i in range(4)])
-    e.step()
-    e.settle()
+    _flush(e)
     assert e.wb.dirty == set()
     e.store([k(i) for i in range(4, 8)])  # CPU tier full
-    evicted = e.store([k(8)]).evicted_keys
-    assert evicted == [k(0)]  # the written, demoted block went first
-    assert e.manager.lookup(k(0), e.ctx) is LookupResult.HIT_PENDING  # promote
+    (victim,) = e.store([k(8)]).evicted_keys
+    assert victim in [k(i) for i in range(4)]  # a written, demoted block
+    assert e.manager.lookup(victim, e.ctx) is LookupResult.HIT_PENDING  # promote
     e.step()  # submits the load
     e.settle()
-    assert e.manager.lookup(k(0), e.ctx) is LookupResult.HIT
-    spec = e.manager.prepare_load([k(0)], e.ctx)
+    assert e.manager.lookup(victim, e.ctx) is LookupResult.HIT
+    spec = e.manager.prepare_load([victim], e.ctx)
     row = e.tensor[int(spec.chunk_ids[0])]
-    assert torch.all(row == e.patterns[k(0)])
-    e.manager.complete_load([k(0)], e.ctx)
+    assert torch.all(row == e.patterns[victim])
+    e.manager.complete_load([victim], e.ctx)
     assert _M.WRITEBACK_LOST not in e.stats()
 
 
@@ -516,15 +514,13 @@ def test_reset_cache_drops_writeback_state(env):
     wb = e.wb
     assert not (wb.dirty or wb.flushing or wb.touched)
     assert not e.manager._writeback_jobs and not e.manager._writeback_parent
-    assert e.stats()[_M.WRITEBACK_LOST] == 5  # the 5 never written
+    assert e.stats()[_M.WRITEBACK_LOST] == 9  # all but the one in flight
 
 
 def test_arc_policy_supported(env):
     e = env(cache_policy="arc")
     e.store([k(i) for i in range(10)])
-    e.step()
-    assert [sorted(j.keys) for j in e.jobs()] == [[k(i) for i in range(5)]]
-    e.settle()
+    assert sorted(key for keys in _flush(e) for key in keys) == [k(i) for i in range(5)]
     assert len(e.wb.dirty) == 5
 
 
@@ -541,8 +537,7 @@ def test_request_finish_learns_prefix_links(env):
     # request finish made the head most recent: the tail is the cold pick,
     # and its prefix goes first
     assert e.lru_order() == chain[::-1]
-    e.step()
-    assert [list(j.keys) for j in e.jobs()] == [chain[:3]]
+    assert _flush(e) == [[key] for key in chain[:3]]
 
 
 def test_request_touch_learns_links_only_for_cpu_blocks(env):
@@ -565,9 +560,7 @@ def test_hybrid_request_hits_from_disk_after_eviction(env):
     e.store([key for group in keys for key in group])
     for group in keys:  # prefix links, as request finish passes them
         e.manager.touch(group, e.ctx)
-    e.step()  # 24 blocks >= 20: write everything unwritten (low 0)
-    for _ in range(5):
-        e.settle()
+    assert len(_flush(e)) == n  # 24 blocks >= 20: write all (low 0), by chunk
     assert not e.wb.dirty
     e.store([k(100 + i) for i in range(40)])  # evicts the whole request
     assert all(e.policy.get(key) is None for group in keys for key in group)
@@ -627,18 +620,33 @@ def test_hybrid_request_hits_from_disk_after_eviction(env):
         e.manager.complete_load([key], e.ctx)
 
 
-def test_flush_jobs_stay_small(env):
-    """Each write-back job pins its blocks until its last write lands and one
-    long job counts toward the fs tier's stall detector (breaker_stall_s), so a
-    large flush is split into jobs of at most _WRITEBACK_JOB_BLOCKS plus the
-    group siblings of the last chunk."""
+def test_flush_jobs_are_one_chunk_one_at_a_time(env):
+    """Reads first: a promotion queues behind at most one write-back job, and
+    that job is a single chunk (its group siblings)."""
     e = env(n_blocks=200, high=0.5, low=0.0)
     e.store([k(c, g) for c in range(30) for g in range(4)])  # 120 blocks
-    e.step()
-    sizes = [len(j.keys) for j in e.jobs()]
-    assert sum(sizes) == 120
-    assert max(sizes) <= tm._WRITEBACK_JOB_CHUNKS + 3
-    assert all(size % 4 == 0 for size in sizes)  # chunks never split
-    for _ in range(len(sizes)):
-        e.settle()
-    assert not e.wb.dirty and not e.jobs()
+    assert _flush(e) == [[k(c, g) for g in range(4)] for c in range(30)]
+    assert not e.wb.dirty
+
+
+def test_no_flush_while_promotion_in_flight(env, monkeypatch):
+    """The flusher submits nothing while a load from the tier is in flight,
+    and resumes once it is done."""
+    e = env(n_blocks=8, high=0.5, low=0.0)
+    e.tier.submit_store(make_job(900, [k(100)], [7]))
+    drain(e.tier)  # k100: on disk only
+    gate = _blocking_store(monkeypatch, "batch_load_block")
+    try:
+        assert e.manager.lookup(k(100), e.ctx) is LookupResult.HIT_PENDING
+        e.store([k(i) for i in range(4)])  # 5 used >= high 4, all dirty
+        e.step()  # submits the promotion; the flusher waits
+        assert [j.is_promotion for j in e.jobs()] == [True]
+        e.step()
+        assert [j.is_promotion for j in e.jobs()] == [True]
+        assert not e.wb.flushing
+        gate.set()
+        e.settle()  # load done; the same step's flusher resumes
+        assert [list(j.keys) for j in e.jobs()] == [[k(0)]]
+        assert e.manager.lookup(k(100), e.ctx) is LookupResult.HIT
+    finally:
+        gate.set()

@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupRole,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -82,6 +83,7 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
+            is_mamba=isinstance(group.kv_cache_spec, MambaSpec),
         )
         for group_id, group in selected_groups
     )

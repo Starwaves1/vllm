@@ -81,6 +81,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
+    get_offload_block_hash,
     make_offload_key,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
@@ -414,6 +415,11 @@ class FileSystemTierManager(SecondaryTierManager):
         self._cache_bytes = 0
         self._reserved_bytes = 0
         self._pinned: Counter[OffloadKey] = Counter()  # in-flight loads
+        # Mamba-state (e.g. GDN) groups, evicted together with their chunk.
+        # Keys carry the KVCacheConfig group id, not the position in groups.
+        self._mamba_groups = [
+            g.group_id for g in offloading_spec.config.groups if g.is_mamba
+        ]
         self._writing: set[OffloadKey] = set()  # in-flight stores
         self._store_job_writes: dict[JobId, list[OffloadKey]] = {}
         if self._max_bytes is not None:
@@ -472,16 +478,27 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def _evict(self, nbytes: int) -> int:
         """Delete least-recently-used files not pinned by an in-flight load
-        until ``nbytes`` are freed (or nothing evictable is left)."""
-        victims: list[OffloadKey] = []
+        until ``nbytes`` are freed (or nothing evictable is left).
+
+        A victim takes the unpinned Mamba-state (GDN) files of its chunk
+        along: a hit ending at that chunk needs every group's file there, so
+        they are useless on their own."""
+        entries = self._entries
+        victims: dict[OffloadKey, None] = {}
         planned = 0
-        for key, size in self._entries.items():
+        for key, size in entries.items():
             if planned >= nbytes:
                 break
-            if key in self._pinned:
+            if key in self._pinned or key in victims:
                 continue
-            victims.append(key)
+            victims[key] = None
             planned += size
+            block_hash = get_offload_block_hash(key)
+            for group_idx in self._mamba_groups:
+                sib = make_offload_key(block_hash, group_idx)
+                if sib in entries and sib not in self._pinned and sib not in victims:
+                    victims[sib] = None
+                    planned += entries[sib]
         freed = 0
         evicted: list[OffloadKey] = []
         for key in victims:
