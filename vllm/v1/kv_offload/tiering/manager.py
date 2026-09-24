@@ -77,6 +77,11 @@ class PendingPromotion:
     chunk_ids: list[int] = field(default_factory=list)
 
 
+# Max bytes of write-back jobs in flight. Promotions (reads) are not queued
+# behind more than this: ~0.3 s on an SLC cache, ~4.5 s on sustained QLC.
+_WRITEBACK_INFLIGHT_BYTES = 256 << 20
+
+
 @dataclass
 class _WritebackState:
     """Write-back bookkeeping for one secondary tier (scheduler thread)."""
@@ -357,6 +362,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._writeback_ctx = ReqContext(req_id=WRITEBACK_REQ_ID)
         if self._writeback:
             primary_tier.eviction_listener = self._on_primary_evicted
+            self._writeback_max_inflight_chunks = max(
+                1, _WRITEBACK_INFLIGHT_BYTES // primary_view.strides[0]
+            )
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -1036,23 +1044,34 @@ class TieringOffloadingManager(OffloadingManager):
         Eviction itself never waits: a chunk evicted before its write started
         is lost to the tier (counted in writeback_lost_blocks).
 
-        Reads first: one job (one chunk) at a time, and none while a
-        promotion is in flight, so a promotion waits behind at most one
-        chunk's writes."""
+        Reads first: nothing is submitted while a promotion is in flight,
+        and at most _WRITEBACK_INFLIGHT_BYTES of writes (one job per chunk,
+        oldest prefix chunk first) are in flight, so a promotion waits behind
+        at most that much."""
         primary = self.primary_tier
-        if wb.flushing or primary.num_used_chunks() < wb.high_chunks:
+        if primary.num_used_chunks() < wb.high_chunks:
             return
         if any(job.transfer_job.is_promotion for job in self._jobs.values()):
             return
+        room = self._writeback_max_inflight_chunks - len(wb.flushing)
+        if room <= 0:
+            return
         window = primary.num_chunks - wb.low_chunks
+        # Plan first: pinning below changes the evictable set being iterated.
+        units: list[list[OffloadKey]] = []
         taken: set[OffloadKey] = set()
         for key in itertools.islice(primary.iter_evictable(), window):
+            if room <= 0:
+                break
             if key not in wb.dirty or key in taken:
                 continue
-            unit = self._plan_writeback_unit(wb, key, taken)
-            if unit:
-                # The oldest unwritten chunk of the prefix; the rest follows.
-                self._submit_writeback(wb, unit[0])
+            for unit in self._plan_writeback_unit(wb, key, taken):
+                if room <= 0:
+                    break
+                units.append(unit)
+                room -= len(unit)
+        for unit in units:
+            if not self._submit_writeback(wb, unit):
                 return
 
     def _submit_writeback(self, wb: _WritebackState, keys: list[OffloadKey]) -> bool:

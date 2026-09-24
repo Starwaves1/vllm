@@ -7,7 +7,8 @@ tier are not cascaded; once per scheduler step, while the CPU tier is filled to
 the high watermark, the coldest chunks the tier lacks are written (with the
 earlier chunks of their prefix and their KV-cache-group siblings) until at most
 the low watermark of the CPU tier is unwritten. Reads first: one chunk per job,
-one job in flight, none while a promotion is in flight.
+at most _WRITEBACK_INFLIGHT_BYTES in flight, none while a promotion is in
+flight. Most tests set that budget to one chunk (one job in flight).
 """
 
 import threading
@@ -18,6 +19,7 @@ import pytest
 import torch
 
 import vllm.v1.kv_offload.tiering.fs.manager as fsm
+import vllm.v1.kv_offload.tiering.manager as tm
 from tests.v1.kv_offload.tiering.test_fs_tier import (
     _BLOCK_ELEMENTS,
     _make_offloading_spec,
@@ -75,6 +77,7 @@ class _Env:
         high=0.5,
         low=0.75,
         cache_policy="lru",
+        inflight_chunks=1,
         **tier_kw,
     ):
         self.tensor = _page_aligned_zero_tensor(n_blocks, _BLOCK_ELEMENTS)
@@ -98,6 +101,8 @@ class _Env:
             primary_tier=self.primary, secondary_tiers=[self.tier]
         )
         self.wb = self.manager._writeback.get(0)
+        if self.wb is not None and inflight_chunks is not None:
+            self.manager._writeback_max_inflight_chunks = inflight_chunks
         self.ctx = ReqContext(req_id="r0")
         self.manager.on_new_request(self.ctx)
         self.patterns: dict[OffloadKey, float] = {}
@@ -170,7 +175,7 @@ def _blocking_store(monkeypatch, name="batch_store_block"):
 
 def _flush(e):
     """Step until the flusher idles; return each write-back job's keys. At
-    most one job is ever in flight."""
+    most one job is ever in flight (the default one-chunk budget)."""
     written = []
     e.step()
     while e.jobs():
@@ -635,7 +640,7 @@ def test_flush_jobs_are_one_chunk_one_at_a_time(env):
 def test_no_flush_while_promotion_in_flight(env, monkeypatch):
     """The flusher submits nothing while a load from the tier is in flight,
     and resumes once it is done."""
-    e = env(n_blocks=8, high=0.5, low=0.0)
+    e = env(n_blocks=8, high=0.5, low=0.0, inflight_chunks=4)
     e.tier.submit_store(make_job(900, [k(100)], [7]))
     drain(e.tier)  # k100: on disk only
     gate = _blocking_store(monkeypatch, "batch_load_block")
@@ -649,7 +654,7 @@ def test_no_flush_while_promotion_in_flight(env, monkeypatch):
         assert not e.wb.flushing
         gate.set()
         e.settle()  # load done; the same step's flusher resumes
-        assert [list(j.keys) for j in e.jobs()] == [[k(0)]]
+        assert [list(j.keys) for j in e.jobs()] == [[k(i)] for i in range(4)]
         assert e.manager.lookup(k(100), e.ctx) is LookupResult.HIT
     finally:
         gate.set()
@@ -681,3 +686,106 @@ def test_prefix_walk_by_chunk_with_pruned_gdn_blocks(env):
         e.settle()
     assert order == [k(c)[:-4] for c in range(n)]
     assert not e.wb.dirty
+
+
+def test_flush_budget_keeps_several_chunk_jobs_in_flight(env):
+    """With no promotion in flight, one step submits one-chunk jobs in prefix
+    order until the in-flight budget is used, so the disk isn't left idle
+    between scheduler steps."""
+    e = env(n_blocks=200, high=0.5, low=0.0, inflight_chunks=None)
+    assert (
+        e.manager._writeback_max_inflight_chunks == tm._WRITEBACK_INFLIGHT_BYTES // _BS
+    )
+    e.manager._writeback_max_inflight_chunks = 12  # 3 chunks of 4 groups
+    groups = [[k(c, g) for c in range(30)] for g in range(4)]
+    e.store([key for group in groups for key in group])  # 120 blocks
+    for group in groups:  # LRU: the tail chunks are coldest
+        e.manager.touch(group, e.ctx)
+    e.step()
+    chunk = [[k(c, g) for g in range(4)] for c in range(30)]
+    assert [sorted(j.keys) for j in e.jobs()] == chunk[:3]
+    e.step()
+    assert len(e.jobs()) == 3  # budget used: nothing more until one finishes
+    e.settle()
+    assert [sorted(j.keys) for j in e.jobs()] == chunk[3:6]
+
+
+def test_prod_config_accepted(tmp_path):
+    """The deployed kv_connector_extra_config (qwen-vllm.service), with the
+    fs tier moved to tmp_path and a small CPU tier: every key is accepted,
+    including ones main no longer reads (mamba_keep_every_n_chunks)."""
+    from tests.v1.kv_connector.unit.utils import create_vllm_config
+    from vllm.config import KVTransferConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        build_offloading_config,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    extra_config = {
+        "spec_name": "TieringOffloadingSpec",
+        "cpu_bytes_to_use": 1 << 20,  # prod: 25769803776
+        "sync_load": True,
+        "mamba_keep_every_n_chunks": 8,
+        "secondary_tiers": [
+            {
+                "type": "fs",
+                "root_dir": str(tmp_path),  # prod: /mnt/kvcache/tier
+                "max_bytes": 300000000000,
+                "n_read_threads": 8,
+                "n_write_threads": 4,
+                "store_policy": "write_back",
+                "writeback_high_watermark": 0.85,
+                "writeback_low_watermark": 0.5,
+                "max_inflight_store_bytes": 5000000000,
+                "breaker_consecutive_failures": 8,
+                "breaker_probe_interval_s": 300,
+                "breaker_probe_timeout_s": 30,
+                "breaker_stall_s": 600,
+            }
+        ],
+    }
+    vllm_config = create_vllm_config(block_size=4, max_num_batched_tokens=16)
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_load_failure_policy="recompute",
+        kv_connector_extra_config=extra_config,
+    )
+    attn = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attn.page_size_bytes * 16,
+                layers=["layer"],
+                layer_stride=attn.page_size_bytes * 16,
+                block_stride=attn.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], attn)],
+    )
+    spec = TieringOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    manager = spec.get_manager()
+    try:
+        (tier,) = manager.secondary_tiers
+        assert isinstance(tier, FileSystemTierManager)
+        assert tier.store_policy == StorePolicy.WRITE_BACK
+        assert (tier.writeback_high_watermark, tier.writeback_low_watermark) == (
+            0.85,
+            0.5,
+        )
+        assert tier._max_bytes == 300 * 10**9
+        assert tier._max_inflight_store_bytes == 5 * 10**9
+        assert (tier._breaker_threshold, tier._stall_s) == (8, 600.0)
+        assert (tier._probe_interval, tier._probe_timeout) == (300.0, 30.0)
+        assert tier.bp_detector is None  # no "backpressure" key: off
+        assert 0 in manager._writeback
+    finally:
+        manager.shutdown()
