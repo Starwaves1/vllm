@@ -19,7 +19,11 @@ Bounded mode (``max_bytes`` set):
     and evict least-recently-used files that no in-flight load is reading;
     lookups, loads and touches refresh recency. Lookups are answered from the
     index synchronously, so a disk hit starts its promotion in the same step.
-    The directory ``<base_path>_r<rank>`` must be owned by one engine.
+    ``max_bytes`` bounds the whole ``root_dir``, not this key alone: block
+    files other keys leave under it (an abandoned model or config) count
+    against the cap and are evicted oldest-first before our own, so stale
+    keys cannot fill the device. The directory ``<base_path>_r<rank>`` must
+    be owned by one engine, because that is what lookups resolve against.
 
 Store backlog cap (``max_inflight_store_bytes`` set):
     Every store job pins its primary (CPU) blocks until the write finishes, so
@@ -54,7 +58,7 @@ import json
 import os
 import threading
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -114,6 +118,7 @@ class FsTierMetrics:
 
     CACHE_BYTES = "vllm:kv_offload_fs_cache_bytes"
     CACHE_BLOCKS = "vllm:kv_offload_fs_cache_blocks"
+    ROOT_BYTES = "vllm:kv_offload_fs_root_bytes"
     LOAD_BYTES = "vllm:kv_offload_fs_load_bytes"
     LOAD_TIME = "vllm:kv_offload_fs_load_time"
     LOAD_FAILURES = "vllm:kv_offload_fs_load_failures"
@@ -185,8 +190,9 @@ class FileSystemTierManager(SecondaryTierManager):
         variable to the same value on all instances overrides the default seed,
         and is required to share a cache when using a non-cryptographic
         prefix-caching hash algorithm, which seeds ``NONE_HASH`` randomly.
-        Bounded mode (``max_bytes``) requires one owner per directory, so it
-        is not meant for sharing.
+        Bounded mode (``max_bytes``) requires one owner per key directory,
+        because lookups resolve against it; the cap itself spans every key
+        under ``root_dir``.
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
@@ -202,6 +208,13 @@ class FileSystemTierManager(SecondaryTierManager):
             ),
             m.CACHE_BLOCKS: OffloadingGaugeMetadata(
                 documentation="Block files held by a bounded fs KV tier."
+            ),
+            m.ROOT_BYTES: OffloadingGaugeMetadata(
+                documentation=(
+                    "Block-file bytes under the fs tier's root_dir -- this "
+                    "key live, other keys as scanned at startup. What "
+                    "max_bytes budgets."
+                )
             ),
             m.LOAD_BYTES: OffloadingCounterMetadata(
                 documentation="Bytes promoted from the fs tier to the CPU tier."
@@ -273,7 +286,11 @@ class FileSystemTierManager(SecondaryTierManager):
         locality: Whether this tier's storage is LOCAL or REMOTE relative
             to the publishing vLLM instance.
         backpressure_detector: Optional backpressure detector.
-        max_bytes: Cap on block-file bytes (LRU eviction). None keeps the
+        max_bytes: Cap on block-file bytes under ``root_dir``, across every
+            key it holds (LRU eviction, other keys first): set it to that
+            directory's budget, not a per-key share. Other keys are counted
+            once at startup, so engines sharing a root bound themselves
+            best-effort -- prefer a filesystem quota there. None keeps the
             historical unbounded, write-through-forever behavior.
         max_inflight_store_bytes: Cap on bytes of unfinished store jobs;
             over it, new store batches are declined. None: no cap.
@@ -400,6 +417,8 @@ class FileSystemTierManager(SecondaryTierManager):
         self._n_stores_dropped = 0
         self._n_breaker_trips = 0
 
+        # Every key lives under root_dir; the cap spans all of them.
+        self._root_dir = os.path.normpath(root_dir)
         # Record the device of the tier directory: jobs and the probe fail
         # instead of creating a new tree on the parent filesystem if the
         # drive is unmounted (e.g. a nofail mount).
@@ -413,6 +432,10 @@ class FileSystemTierManager(SecondaryTierManager):
         # Bounded-mode accounting. Scheduler thread only.
         self._entries: OrderedDict[OffloadKey, int] = OrderedDict()  # LRU first
         self._cache_bytes = 0
+        # Block files under root_dir that belong to another key: charged to the
+        # same cap, reclaimed oldest-first before our own. (path, size).
+        self._foreign: deque[tuple[str, int]] = deque()
+        self._foreign_bytes = 0
         self._reserved_bytes = 0
         self._pinned: Counter[OffloadKey] = Counter()  # in-flight loads
         # Mamba-state (e.g. GDN) groups, evicted together with their chunk.
@@ -424,17 +447,28 @@ class FileSystemTierManager(SecondaryTierManager):
         self._store_job_writes: dict[JobId, list[OffloadKey]] = {}
         if self._max_bytes is not None:
             self._scan_existing()
-            excess = self._cache_bytes - self._max_bytes
+            self._scan_foreign()
+            excess = self._root_bytes - self._max_bytes
             if excess > 0:
+                logger.info(
+                    "fs KV tier '%s': %.1f GB over its %.1f GB cap; "
+                    "reclaiming the oldest block files under %s",
+                    tier_type,
+                    excess / 1e9,
+                    self._max_bytes / 1e9,
+                    self._root_dir,
+                )
                 self._evict(excess)
             logger.info(
                 "fs KV tier '%s' bounded to %.1f GB at %s: %d block files "
-                "(%.1f GB) indexed at startup",
+                "(%.1f GB) indexed at startup, %.1f GB in other keys under %s",
                 tier_type,
                 self._max_bytes / 1e9,
                 self._storage_dir,
                 len(self._entries),
                 self._cache_bytes / 1e9,
+                self._foreign_bytes / 1e9,
+                self._root_dir,
             )
 
         self._pool = DualQueueThreadPool(
@@ -476,13 +510,93 @@ class FileSystemTierManager(SecondaryTierManager):
             self._entries[key] = size
             self._cache_bytes += size
 
+    @property
+    def _root_bytes(self) -> int:
+        """Block-file bytes under root_dir: ours plus every other key's."""
+        return self._cache_bytes + self._foreign_bytes
+
+    def _scan_foreign(self) -> None:
+        """Index the block files other keys left under ``root_dir``, oldest
+        mtime first, so they count against the cap and can be reclaimed.
+
+        Only ``<model>_<digest>_r<rank>`` key directories are visited and only
+        ``*.bin`` inside them: a shared root may hold model weights, and a
+        ``*.tmp`` under another key is a write in flight. Our own directory is
+        skipped (``_scan_existing`` owns it); files off the tier's device are
+        skipped too, so an unmounted drive is never deleted through, and
+        ``lstat`` sizes a symlink as itself rather than its target.
+
+        Counted once at startup, so another key writing after that is not
+        seen until the next start -- enough for keys left by earlier runs,
+        and it keeps the walk off the hot path.
+        """
+        own = os.path.normpath(self._storage_dir)
+        found: list[tuple[int, str, int]] = []
+        for entry in os.scandir(self._root_dir):
+            head, sep, rank = entry.name.rpartition("_r")
+            if not (sep and rank.isdigit() and entry.is_dir()):
+                continue
+            # A real key has its own config dir beside it; without this any
+            # user directory named *_r<N> would count and be reclaimed.
+            if not os.path.isfile(os.path.join(self._root_dir, head, "config.json")):
+                continue
+            if os.path.normpath(entry.path) == own:
+                continue
+            for dirpath, _, filenames in os.walk(entry.path):
+                for name in filenames:
+                    if not name.endswith(".bin"):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    try:
+                        st = os.lstat(path)
+                    except OSError:
+                        continue
+                    if st.st_dev != self._storage_dev:
+                        continue
+                    found.append((st.st_mtime_ns, path, st.st_size))
+        found.sort(key=lambda t: t[0])
+        self._foreign = deque((path, size) for _, path, size in found)
+        self._foreign_bytes = sum(size for _, _, size in found)
+
+    def _evict_foreign(self, nbytes: int) -> int:
+        """Delete other keys' oldest block files until ``nbytes`` are freed
+        (or none are left). A file that cannot be removed is dropped from the
+        queue but keeps its bytes on the cap, so a permanently unwritable key
+        costs one attempt instead of one per store."""
+        freed = 0
+        for _ in range(len(self._foreign)):
+            if freed >= nbytes:
+                break
+            path, size = self._foreign.popleft()
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("fs KV tier: failed to evict block file: %s", exc)
+                continue
+            self._foreign_bytes -= size
+            freed += size
+            self._n_evicted_bytes += size
+        return freed
+
     def _evict(self, nbytes: int) -> int:
         """Delete least-recently-used files not pinned by an in-flight load
         until ``nbytes`` are freed (or nothing evictable is left).
 
+        Other keys' files under ``root_dir`` go first: an abandoned key is
+        the usual way the device fills up, and an engine that loses a file
+        its index still has self-heals on the failed load. Their recency is
+        a startup mtime snapshot rather than a live LRU, so a peer's
+        read-hot file can look colder than our own coldest one.
+
         A victim takes the unpinned Mamba-state (GDN) files of its chunk
         along: a hit ending at that chunk needs every group's file there, so
         they are useless on their own."""
+        foreign_freed = self._evict_foreign(nbytes)
+        if foreign_freed >= nbytes:
+            return foreign_freed
+        nbytes -= foreign_freed
         entries = self._entries
         victims: dict[OffloadKey, None] = {}
         planned = 0
@@ -527,7 +641,7 @@ class FileSystemTierManager(SecondaryTierManager):
                         locality=self.locality,
                     )
                 )
-        return freed
+        return foreign_freed + freed
 
     def _admit_store(
         self, job_id: JobId, keys: list[OffloadKey], chunk_ids: Iterable[int]
@@ -547,7 +661,7 @@ class FileSystemTierManager(SecondaryTierManager):
             new_cids.append(int(cid))
         bs = self._block_size
         n = len(new_keys)
-        room = self._max_bytes - self._cache_bytes - self._reserved_bytes
+        room = self._max_bytes - self._root_bytes - self._reserved_bytes
         freed = 0
         if n * bs > room:
             # Evict at most this job's size plus a few files: after an ENOSPC
@@ -641,6 +755,9 @@ class FileSystemTierManager(SecondaryTierManager):
         """Lower max_bytes after ENOSPC. False once it is at its floor: the
         disk is full for other reasons, so the failure counts as one."""
         assert self._max_bytes is not None and self._min_max_bytes is not None
+        # Own bytes, not _root_bytes: once root_dir is over the cap,
+        # 0.95*root >= max, the guard below never lowers it, and ENOSPC gets
+        # swallowed without the breaker ever seeing it.
         new_max = max(int(self._cache_bytes * 0.95), self._min_max_bytes)
         if new_max >= self._max_bytes:
             # Already shrunk for this episode, unless at the floor.
@@ -994,6 +1111,7 @@ class FileSystemTierManager(SecondaryTierManager):
         if self._max_bytes is not None:
             stats.set_gauge(m.CACHE_BYTES, self._cache_bytes)
             stats.set_gauge(m.CACHE_BLOCKS, len(self._entries))
+            stats.set_gauge(m.ROOT_BYTES, self._root_bytes)
         if self._breaker_threshold > 0:
             stats.set_gauge(m.DISABLED, int(self._tripped))
         for name, attr in (
