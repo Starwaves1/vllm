@@ -4,8 +4,10 @@
 
 Covers the bounded fs tier with LRU eviction (cf. open upstream #54327):
 synchronous index lookups, pins for in-flight loads, skip-not-fail when full,
-startup rescan and the fs-tier metrics; then the in-flight store cap
-(``max_inflight_store_bytes``) and the circuit breaker with probe recovery.
+startup rescan and the fs-tier metrics; the root_dir-wide cap, which charges
+other keys' files to the same budget and reclaims them before our own; then
+the in-flight store cap (``max_inflight_store_bytes``) and the circuit breaker
+with probe recovery.
 
 Run: CUDA_VISIBLE_DEVICES= python -m pytest -q \
     tests/v1/kv_offload/tiering/test_fs_tier_bounded.py
@@ -797,6 +799,27 @@ def test_enospc_shrinks_max_bytes_instead_of_tripping(tmp_path, monkeypatch):
         tier.shutdown()
 
 
+def test_enospc_shrink_tracks_own_bytes_not_the_whole_root(tmp_path, monkeypatch):
+    _seed_foreign(str(tmp_path), _BS, [900, 800])
+    tier, _ = _tier(tmp_path, max_bytes=20 * _BS, breaker_consecutive_failures=1)
+    try:
+        assert tier._foreign_bytes == 2 * _BS
+        for i in range(12):
+            _store(tier, i, [i], [i % 8])
+        _failing(monkeypatch, "batch_store_block", errno.ENOSPC)
+        tier.submit_store(make_job(20, [key(20)], [5]))
+        assert [r.success for r in drain(tier)] == [False]
+        # The shrink sizes itself from our 12 blocks, not the 14 now under
+        # root_dir: that value is what separates the two bases, since a
+        # root-based one would land on 14 * 0.95. The shrink itself deletes
+        # nothing.
+        assert tier._max_bytes == int(12 * _BS * 0.95)
+        assert not tier._tripped and tier._consecutive_failures == 0
+        assert tier._foreign_bytes == 2 * _BS
+    finally:
+        tier.shutdown()
+
+
 def test_storecap_breaker_config_and_metric_definitions(tmp_path):
     tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
     tier = SecondaryTierFactory.create_secondary_tier(
@@ -1010,5 +1033,187 @@ def test_device_guard_blocks_writes_and_probe(tmp_path, monkeypatch):
         tier._tripped = False
         assert [r.success for r in _store(tier, 4, [2], [1])] == [False]
         assert not os.path.exists(tier._storage_dir)
+    finally:
+        tier.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# global cap: max_bytes spans every key under root_dir
+# ---------------------------------------------------------------------------
+
+
+def _seed_foreign(
+    root: str, size: int, ages: list[int], key_dir: str = "other_model_000000000000_r0"
+) -> list[str]:
+    """Block files of ``size`` bytes under a foreign key dir, ``ages`` seconds
+    old: ages[0] is the oldest, so it is what a root-wide cap reclaims first.
+    Includes the ``<model>_<digest>/config.json`` sibling real keys are born
+    with, which the scan uses to tell a key dir from an unrelated ``*_r<N>``."""
+    now = time.time()
+    paths = []
+    head = key_dir.rpartition("_r")[0]
+    os.makedirs(os.path.join(root, head), exist_ok=True)
+    with open(os.path.join(root, head, "config.json"), "w") as fh:
+        fh.write("{}")
+    for i, age in enumerate(ages):
+        path = os.path.join(root, key_dir, f"{i:03x}", "aa_g0", f"{i:032x}.bin")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\0" * size)
+        os.utime(path, (now - age, now - age))
+        paths.append(path)
+    return paths
+
+
+def test_global_cap_counts_and_reclaims_other_keys_at_startup(tmp_path):
+    stale = _seed_foreign(str(tmp_path), _BS, [400, 300, 200, 100])
+    tier, _ = _tier(tmp_path, max_bytes=3 * _BS)
+    try:
+        # Our own dir is empty, so a per-key cap would boot clean and leave all
+        # four stale files -- the state that fills the device across restarts.
+        assert tier._cache_bytes == 0
+        assert tier._foreign_bytes == 3 * _BS
+        assert not os.path.exists(stale[0])
+        assert all(os.path.exists(p) for p in stale[1:])
+        assert tier._root_bytes == 3 * _BS
+    finally:
+        tier.shutdown()
+
+
+def test_global_cap_evicts_other_keys_before_own(tmp_path):
+    tier, _ = _tier(tmp_path, max_bytes=6 * _BS)
+    for i in range(3):
+        _store(tier, i, [i], [i])
+    tier.shutdown()
+    stale = _seed_foreign(str(tmp_path), _BS, [600, 500, 400])
+
+    # root_dir is exactly at the cap: the next block has no room of its own.
+    tier2, _ = _tier(tmp_path, max_bytes=6 * _BS)
+    try:
+        assert tier2._root_bytes == 6 * _BS
+        _store(tier2, 9, [3], [3])
+        assert _exists(tier2, 3)
+        assert all(_exists(tier2, i) for i in range(3))  # own files kept
+        assert not os.path.exists(stale[0])  # oldest foreign reclaimed
+        assert all(os.path.exists(p) for p in stale[1:])
+        assert tier2._cache_bytes == 4 * _BS
+        assert tier2._foreign_bytes == 2 * _BS
+        assert tier2._root_bytes == 6 * _BS
+        stats = tier2.get_stats().reduce()
+        assert stats["vllm:kv_offload_fs_evicted_bytes"] == _BS
+        assert stats["vllm:kv_offload_fs_cache_bytes"] == 4 * _BS
+        assert stats["vllm:kv_offload_fs_root_bytes"] == 6 * _BS
+    finally:
+        tier2.shutdown()
+
+
+def test_global_cap_does_not_count_own_files_as_foreign(tmp_path):
+    tier, _ = _tier(tmp_path, max_bytes=8 * _BS)
+    for i in range(4):
+        _store(tier, i, [i], [i])
+    tier.shutdown()
+    tier2, _ = _tier(tmp_path, max_bytes=8 * _BS)
+    try:
+        # Our own files sit under root_dir too; counting them twice would
+        # shrink the cap to half of what was configured.
+        assert tier2._cache_bytes == 4 * _BS
+        assert tier2._foreign_bytes == 0
+        assert tier2._root_bytes == 4 * _BS
+    finally:
+        tier2.shutdown()
+
+
+def test_global_cap_leaves_other_keys_tmp_files_alone(tmp_path):
+    stray = os.path.join(
+        tmp_path, "other_model_000000000000_r0", "aa", "aa_g0", "x.tmp"
+    )
+    os.makedirs(os.path.dirname(stray), exist_ok=True)
+    open(stray, "wb").close()
+    tier, _ = _tier(tmp_path, max_bytes=_BS)
+    try:
+        assert os.path.exists(stray)  # a write in flight under another key
+        assert tier._foreign_bytes == 0
+    finally:
+        tier.shutdown()
+
+
+def test_global_cap_lookup_still_ignores_other_keys(tmp_path):
+    tier, _ = _tier(tmp_path, max_bytes=8 * _BS)
+    own = tier.file_mapper.get_file_name(key(0))
+    storage = tier._storage_dir
+    tier.shutdown()
+    config_dir = os.path.join(tmp_path, "other_model_000000000000")
+    os.makedirs(config_dir, exist_ok=True)
+    with open(os.path.join(config_dir, "config.json"), "w") as fh:
+        fh.write("{}")
+    twin = os.path.join(
+        tmp_path, "other_model_000000000000_r0", os.path.relpath(own, storage)
+    )
+    os.makedirs(os.path.dirname(twin), exist_ok=True)
+    with open(twin, "wb") as fh:
+        fh.write(b"\0" * _BS)
+
+    tier2, _ = _tier(tmp_path, max_bytes=8 * _BS)
+    try:
+        # The block hash names both files, but only ours may answer a lookup:
+        # the hash carries no model or config identity.
+        assert tier2._foreign_bytes == _BS
+        assert tier2.lookup(key(0), _CTX) is LookupResult.MISS
+    finally:
+        tier2.shutdown()
+
+
+def test_global_cap_ignores_files_outside_key_dirs(tmp_path):
+    stale = _seed_foreign(str(tmp_path), _BS, [400, 300, 200, 100])
+    # root_dir may be shared with things that are not tier data: a model
+    # checkpoint next to the tier, and a directory that is not a key dir.
+    weights = os.path.join(tmp_path, "pytorch_model-00001-of-00002.bin")
+    with open(weights, "wb") as fh:
+        fh.write(b"\0" * (4 * _BS))
+    stray = os.path.join(tmp_path, "notakeydir", "deep", "payload.bin")
+    os.makedirs(os.path.dirname(stray), exist_ok=True)
+    with open(stray, "wb") as fh:
+        fh.write(b"\0" * (4 * _BS))
+    # ...and a user directory that happens to end in _r<N>, with no config
+    # dir beside it -- the one shape the key-dir predicate alone would match.
+    user = os.path.join(tmp_path, "llama-ft_r1", "weights.bin")
+    os.makedirs(os.path.dirname(user), exist_ok=True)
+    with open(user, "wb") as fh:
+        fh.write(b"\0" * (4 * _BS))
+
+    tier, _ = _tier(tmp_path, max_bytes=3 * _BS)  # reclaims one stale block
+    try:
+        assert tier._foreign_bytes == 3 * _BS  # 12 *_BS of non-key files ignored
+        assert os.path.exists(weights) and os.path.exists(stray)
+        assert os.path.exists(user)
+        assert not os.path.exists(stale[0])
+    finally:
+        tier.shutdown()
+
+
+def test_global_cap_gives_up_on_undeletable_other_keys(tmp_path, monkeypatch):
+    stale = _seed_foreign(str(tmp_path), _BS, [400, 300, 200, 100])
+    attempts: list[str] = []
+    real_remove = os.remove
+
+    def deny(path, *args, **kwargs):
+        attempts.append(path)
+        if path in stale:
+            raise PermissionError(13, "Permission denied")
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", deny)
+    tier, _ = _tier(tmp_path, max_bytes=2 * _BS)  # wants 2 of the 4 back
+    try:
+        # Each file is tried once and dropped, but its bytes stay on the cap:
+        # the disk is still holding them, and they must never be retried on
+        # every store that needs room. (The startup O_DIRECT probe also calls
+        # os.remove, hence the filter.)
+        assert sorted(p for p in attempts if p in stale) == sorted(stale)
+        assert tier._foreign_bytes == 4 * _BS
+        assert all(os.path.exists(p) for p in stale)
+        attempts.clear()
+        tier._evict(4 * _BS)
+        assert not any(p in stale for p in attempts)
     finally:
         tier.shutdown()
